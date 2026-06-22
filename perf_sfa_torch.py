@@ -111,13 +111,14 @@ def run_profiling():
     import torch_npu.profiler as npu_prof
     q, k, qr, kr, si, scale = _build()
     out_dir = "./profiler_data_sfa_torch"
-    total_steps = 10
+    for _ in range(3):
+        run_sfa(q, k, qr, kr, si, 1, SPARSE_MODE, scale, return_lse=True)
+    _synchronize()
     with npu_prof.profile(
         activities=[npu_prof.ProfilerActivity.CPU, npu_prof.ProfilerActivity.NPU],
-        schedule=npu_prof.schedule(wait=2, warmup=2, active=4, repeat=1, skip_first=2),
         on_trace_ready=npu_prof.tensorboard_trace_handler(out_dir),
     ) as prof:
-        for _ in range(total_steps):
+        for _ in range(10):
             run_sfa(q, k, qr, kr, si, 1, SPARSE_MODE, scale, return_lse=True)
             prof.step()
     _synchronize()
