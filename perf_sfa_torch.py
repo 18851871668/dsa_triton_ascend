@@ -10,7 +10,6 @@ Run:
 from __future__ import annotations
 
 import csv
-import os
 import sys
 import time
 
@@ -87,43 +86,74 @@ def run_timing():
     print(f"triton:  median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
 
 
-def _print_kernel_details(out_dir):
-    path = os.path.join(out_dir, "ASCEND_PROFILER_OUTPUT", "kernel_details.csv")
-    if not os.path.isfile(path):
-        print(f"No kernel_details.csv found at {path}")
-        return
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        rows = [r for r in reader if r.get("Name", "").startswith("_sfa_kernel")]
-    if not rows:
-        print("No _sfa_kernel rows found in kernel_details.csv")
-        return
-    durations = [float(r["Duration(us)"]) for r in rows if r.get("Duration(us)")]
-    avg_us = sum(durations) / len(durations)
-    print(f"\n{'='*80}")
-    print(f"_sfa_kernel: {len(rows)} calls, avg={avg_us:.2f}us ({avg_us/1000:.3f}ms)")
-    print(f"{'='*80}")
-    for r in rows:
-        print(f"  {r.get('Name','')}  {r.get('Duration(us)','')}us")
+def _normalize_col_name(name):
+    return name.strip().lower().replace(" ", "").replace("_", "")
+
+
+def _find_avg_time_us(out_dir, kernel_name):
+    from pathlib import Path
+    search_root = Path(out_dir)
+    csv_files = sorted(search_root.rglob("op_statistic.csv"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    for csv_path in csv_files:
+        with csv_path.open("r", newline="", errors="ignore") as f:
+            reader = csv.DictReader(f, delimiter=",")
+            if not reader.fieldnames:
+                continue
+            col_map = {_normalize_col_name(c): c for c in reader.fieldnames if c}
+            op_type_col = col_map.get("optype")
+            avg_time_col = col_map.get("avgtime(us)")
+            if op_type_col is None or avg_time_col is None:
+                continue
+            for row in reader:
+                if row.get(op_type_col, "").strip() != kernel_name:
+                    continue
+                try:
+                    return float(row[avg_time_col]), str(csv_path)
+                except ValueError:
+                    return None, str(csv_path)
+    return None, None
 
 
 def run_profiling():
+    import torch_npu
     import torch_npu.profiler as npu_prof
     q, k, qr, kr, si, scale = _build()
     out_dir = "./profiler_data_sfa_torch"
-    for _ in range(3):
-        run_sfa(q, k, qr, kr, si, 1, SPARSE_MODE, scale, return_lse=True)
-    _synchronize()
+    kernel_name = "_sfa_kernel"
+
+    wait, warmup_n, active, repeat, skip_first = 1, 1, 20, 1, 1
+    total_steps = skip_first + repeat * (wait + warmup_n + active)
+
+    experimental_config = npu_prof._ExperimentalConfig(
+        aic_metrics=npu_prof.AiCMetrics.PipeUtilization,
+        profiler_level=npu_prof.ProfilerLevel.Level1,
+        l2_cache=False,
+    )
+
     with npu_prof.profile(
-        activities=[npu_prof.ProfilerActivity.CPU, npu_prof.ProfilerActivity.NPU],
+        activities=[npu_prof.ProfilerActivity.NPU],
+        with_stack=False,
+        record_shapes=False,
+        profile_memory=False,
+        schedule=npu_prof.schedule(wait=wait, warmup=warmup_n, active=active,
+                                   repeat=repeat, skip_first=skip_first),
+        experimental_config=experimental_config,
         on_trace_ready=npu_prof.tensorboard_trace_handler(out_dir),
     ) as prof:
-        for _ in range(10):
+        for _ in range(total_steps):
             run_sfa(q, k, qr, kr, si, 1, SPARSE_MODE, scale, return_lse=True)
+            torch_npu.npu.synchronize()
             prof.step()
-    _synchronize()
+
+    torch_npu.npu.synchronize()
     print(f"Profiler data saved to {out_dir}")
-    _print_kernel_details(out_dir)
+    time_us, csv_path = _find_avg_time_us(out_dir, kernel_name)
+    print(f"\n{'='*80}")
+    print(f"_sfa_kernel avg time: {time_us}us" if time_us else "_sfa_kernel not found in op_statistic.csv")
+    if csv_path:
+        print(f"Source: {csv_path}")
+    print(f"{'='*80}")
 
 
 def run_kernel_only():
