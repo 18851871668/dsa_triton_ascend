@@ -12,6 +12,7 @@ import triton.language as tl
 import triton.backends.ascend.runtime
 
 _D_ROPE = 64
+_GRID_CAP = 1024
 
 
 def _next_pow2(x):
@@ -91,9 +92,9 @@ def _prune_configs(configs, named_args, **kwargs):
         # NB: BLOCK_G may exceed N1; the kernel masks padded heads (g_valid),
         # so we do NOT prune on bg > N1 (would kill all configs for small N1).
         if None not in (BS1, N1) and bg:
-            grid0 = _next_pow2(BS1)
-            grid1 = _next_pow2((N1 + bg - 1) // bg)
-            if grid0 * grid1 > _GRID_LIMIT:
+            grid_g = _next_pow2((N1 + bg - 1) // bg)
+            total_work = BS1 * grid_g
+            if total_work > _GRID_LIMIT:
                 continue
         kept.append(c)
 
@@ -251,6 +252,7 @@ def _sfa_kernel(
     BLOCK_DV: tl.constexpr,
     SINGLE_BLOCK: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
+    GRID_CAP: tl.constexpr,
 ):
     """Flash attention over sparsely gathered KV (BSND, MQA / N2=1).
 
@@ -283,103 +285,177 @@ def _sfa_kernel(
     sm_max_ptr = tl.multiple_of(sm_max_ptr, 128)
     sm_sum_ptr = tl.multiple_of(sm_sum_ptr, 128)
 
-    pid_bs1 = tl.program_id(0)
-    pid_g = tl.program_id(1)
+    pid_flat = tl.program_id(0)
+    grid_g = _next_pow2((N1 + BLOCK_G - 1) // BLOCK_G)
+    total_work = B_S1 * grid_g
+    grid_size = _next_pow2(min(total_work, GRID_CAP))
 
-    bs1_in_range = pid_bs1 < B_S1
-    pid_bs1 = tl.where(bs1_in_range, pid_bs1, 0)
+    for work_id in range(pid_flat, total_work, grid_size):
+        pid_bs1 = work_id // grid_g
+        pid_g = work_id % grid_g
 
-    b = pid_bs1 // S1
-    s1 = pid_bs1 % S1
+        bs1_in_range = pid_bs1 < B_S1
+        pid_bs1 = tl.where(bs1_in_range, pid_bs1, 0)
 
-    g_offs = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
-    g_valid = g_offs < N1
+        b = pid_bs1 // S1
+        s1 = pid_bs1 % S1
 
-    act_q = tl.load(act_q_ptr + b)
-    act_k = tl.load(act_k_ptr + b)
+        g_offs = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
+        g_valid = g_offs < N1
 
-    # causal window upper bound (token threshold)
-    if sparse_mode == 0:
-        threshold = act_k
-    else:
-        threshold = act_k - act_q + s1 + 1
+        act_q = tl.load(act_q_ptr + b)
+        act_k = tl.load(act_k_ptr + b)
 
-    # rightDownCausal: leading rows (query longer than key) are fully hidden.
-    row_active = bs1_in_range & (s1 < act_q) & (threshold > 0)
+        # causal window upper bound (token threshold)
+        if sparse_mode == 0:
+            threshold = act_k
+        else:
+            threshold = act_k - act_q + s1 + 1
 
-    # base offsets (memory layout: q[B,S1,N1,D], k/v[B,S2,1,D], rope analogous)
-    q_base = (b * S1 + s1) * N1 * D
-    qr_base = (b * S1 + s1) * N1 * D_ROPE
-    k_base = b * S2 * D
-    kr_base = b * S2 * D_ROPE
-    v_base = b * S2 * D
-    sp_base = (b * S1 + s1) * topK
+        # rightDownCausal: leading rows (query longer than key) are fully hidden.
+        row_active = bs1_in_range & (s1 < act_q) & (threshold > 0)
 
-    if SINGLE_BLOCK:
-        # ---- fast path: one block covers the whole topK window; scores/P computed
-        # ONCE and kept resident, then dv-tiled P@V. Score/gather recompute is O(1),
-        # not O(dv_tiles*k_blocks) as in the two-pass fallback below. ----
-        blk_offs = tl.arange(0, BLOCK_TOPK)
-        blk_in_count = blk_offs < topK
-        tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
-        tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
-        tok_clamped = tl.where(tok_valid, tok, 0)
+        # base offsets (memory layout: q[B,S1,N1,D], k/v[B,S2,1,D], rope analogous)
+        q_base = (b * S1 + s1) * N1 * D
+        qr_base = (b * S1 + s1) * N1 * D_ROPE
+        k_base = b * S2 * D
+        kr_base = b * S2 * D_ROPE
+        v_base = b * S2 * D
+        sp_base = (b * S1 + s1) * topK
 
-        scores = _sfa_scores_block(
-            q_ptr, q_base, qr_ptr, qr_base,
-            k_ptr, k_base, kr_ptr, kr_base,
-            tok_clamped, tok_valid, g_offs, g_valid,
-            scale_value, D, D_ROPE, BLOCK_G, BLOCK_TOPK, BLOCK_D)
-
-        m_i = tl.max(scores, axis=1)
-        m_safe = tl.where(m_i == float('-inf'), 0.0, m_i)
-        p = tl.exp(scores - m_safe[:, None])
-        p = tl.where(tok_valid[None, :], p, 0.0)
-        l_i = tl.sum(p, axis=1)
-        l_safe = tl.where(l_i > 0.0, l_i, 1.0)
-
-        out_base = (b * S1 + s1) * N1 * D
-        p_norm = p / l_safe[:, None]
-        for dv_start in range(0, D, BLOCK_DV):
-            dv_offs = dv_start + tl.arange(0, BLOCK_DV)
-            dv_valid = dv_offs < D
-            v_tile = tl.load(
-                v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
-                mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
-            out_tile = tl.dot(p_norm.to(v_tile.dtype), v_tile)
-            tl.store(
-                out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
-                out_tile.to(out_ptr.dtype.element_ty),
-                mask=g_valid[:, None] & dv_valid[None, :] & row_active)
-
-        if return_lse:
-            sm_base = (b * S1 + s1) * N1
-            store_mask = g_valid & row_active & (l_i > 0.0)
-            tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
-            tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
-    else:
-        # ---- chunked online-softmax: one pass over KV chunks, per-chunk
-        # correction of fp32 global accumulator. Eliminates two-pass score
-        # recompute, reduces dots ~69% (928 -> 288 for the profiled shape).
-        # Score computation inlined (was _sfa_scores_block) so the compiler
-        # can see Q/QR loads are loop-invariant across blk_start and
-        # potentially reuse/cache them (loop-invariant-hoisting.md). ----
-        m_i = tl.full([BLOCK_G], float('-inf'), dtype=tl.float32)
-        l_i = tl.zeros([BLOCK_G], dtype=tl.float32)
-        fp32_base = (b * S1 + s1) * N1 * D
-
-        for blk_start in range(0, topK - BLOCK_K, BLOCK_K):
-            blk_offs = blk_start + tl.arange(0, BLOCK_K)
+        if SINGLE_BLOCK:
+            # ---- fast path: one block covers the whole topK window; scores/P computed
+            # ONCE and kept resident, then dv-tiled P@V. Score/gather recompute is O(1),
+            # not O(dv_tiles*k_blocks) as in the two-pass fallback below. ----
+            blk_offs = tl.arange(0, BLOCK_TOPK)
             blk_in_count = blk_offs < topK
             tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
             tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
-            tok_clamped = tl.where(tok_valid, tok, 0)
+            tok_clamped = blk_offs
 
-            # Inline score computation (inlined from _sfa_scores_block) so the
-            # compiler sees the full loop structure and can detect that Q/QR
-            # loads are loop-invariant across blk_start iterations.
-            # Load order: Q before K (Q has no dep on tok_clamped, can overlap
-            # with prev iter's fp32_acc store per load-order.md).
+            scores = _sfa_scores_block(
+                q_ptr, q_base, qr_ptr, qr_base,
+                k_ptr, k_base, kr_ptr, kr_base,
+                tok_clamped, tok_valid, g_offs, g_valid,
+                scale_value, D, D_ROPE, BLOCK_G, BLOCK_TOPK, BLOCK_D)
+
+            m_i = tl.max(scores, axis=1)
+            m_safe = tl.where(m_i == float('-inf'), 0.0, m_i)
+            p = tl.exp(scores - m_safe[:, None])
+            p = tl.where(tok_valid[None, :], p, 0.0)
+            l_i = tl.sum(p, axis=1)
+            l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+
+            out_base = (b * S1 + s1) * N1 * D
+            p_norm = p / l_safe[:, None]
+            for dv_start in range(0, D, BLOCK_DV):
+                dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+                dv_valid = dv_offs < D
+                v_tile = tl.load(
+                    v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
+                    mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
+                out_tile = tl.dot(p_norm.to(v_tile.dtype), v_tile)
+                tl.store(
+                    out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
+                    out_tile.to(out_ptr.dtype.element_ty),
+                    mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+
+            if return_lse:
+                sm_base = (b * S1 + s1) * N1
+                store_mask = g_valid & row_active & (l_i > 0.0)
+                tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
+                tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
+        else:
+            # ---- chunked online-softmax: one pass over KV chunks, per-chunk
+            # correction of fp32 global accumulator. Eliminates two-pass score
+            # recompute, reduces dots ~69% (928 -> 288 for the profiled shape).
+            # Score computation inlined (was _sfa_scores_block) so the compiler
+            # can see Q/QR loads are loop-invariant across blk_start and
+            # potentially reuse/cache them (loop-invariant-hoisting.md). ----
+            m_i = tl.full([BLOCK_G], float('-inf'), dtype=tl.float32)
+            l_i = tl.zeros([BLOCK_G], dtype=tl.float32)
+            fp32_base = (b * S1 + s1) * N1 * D
+
+            for blk_start in range(0, topK - BLOCK_K, BLOCK_K):
+                blk_offs = blk_start + tl.arange(0, BLOCK_K)
+                blk_in_count = blk_offs < topK
+                tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
+                tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
+                tok_clamped = blk_offs
+
+                # Inline score computation (inlined from _sfa_scores_block) so the
+                # compiler sees the full loop structure and can detect that Q/QR
+                # loads are loop-invariant across blk_start iterations.
+                # Load order: Q before K (Q has no dep on tok_clamped, can overlap
+                # with prev iter's fp32_acc store per load-order.md).
+                scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
+                for d_start in range(0, D, BLOCK_D):
+                    d_offs = d_start + tl.arange(0, BLOCK_D)
+                    d_valid = d_offs < D
+                    q_tile = tl.load(
+                        q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
+                        mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+                    k_tile = tl.load(
+                        k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
+                        mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+                    scores += tl.dot(q_tile, tl.trans(k_tile))
+                for d_start in range(0, D_ROPE, BLOCK_D):
+                    d_offs = d_start + tl.arange(0, BLOCK_D)
+                    d_valid = d_offs < D_ROPE
+                    qr_tile = tl.load(
+                        qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
+                        mask=g_valid[:, None] & d_valid[None, :], other=0.0)
+                    kr_tile = tl.load(
+                        kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + d_offs[None, :],
+                        mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
+                    scores += tl.dot(qr_tile, tl.trans(kr_tile))
+                scores = scores * scale_value
+                scores = tl.where(tok_valid[None, :], scores, float('-inf'))
+
+                m_blk = tl.max(scores, axis=1)
+                m_new = tl.maximum(m_i, m_blk)
+                m_new_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
+                alpha_old = tl.exp(m_i - m_new_safe)
+                alpha_new = tl.exp(m_blk - m_new_safe)
+
+                m_blk_safe = tl.where(m_blk == float('-inf'), 0.0, m_blk)
+                p_raw = tl.exp(scores - m_blk_safe[:, None])
+                # p_raw = tl.where(tok_valid[None, :], p_raw, 0.0)
+                l_chunk = tl.sum(p_raw, axis=1)
+                l_i = l_i * alpha_old + l_chunk * alpha_new
+
+                for dv_start in range(0, D, BLOCK_DV):
+                    dv_offs = dv_start + tl.arange(0, BLOCK_DV)
+                    dv_valid = dv_offs < D
+                    # Load fp32_acc before V so the independent load can overlap
+                    # with the previous iteration's fp32_acc store (load-order.md).
+                    acc_dv = tl.load(
+                        fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                        mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
+                    v_tile = tl.load(
+                        v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
+                        mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
+                    pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
+                    acc_dv = acc_dv * alpha_old[:, None] + pv_tile
+                    tl.store(
+                        fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
+                        acc_dv,
+                        mask=g_valid[:, None] & dv_valid[None, :] & row_active)
+
+                m_i = m_new
+
+            # Last k-block: compute scores/softmax as above, but fuse the
+            # fp32_acc normalization (divide by l_safe) and write directly to
+            # out_ptr.  Eliminates the separate post-loop dv-tile pass that
+            # reads fp32_acc back from GM (discrete_memory_access.md: eliminate
+            # redundant GM round-trips).
+            last_blk_start = topK - BLOCK_K
+            blk_offs = last_blk_start + tl.arange(0, BLOCK_K)
+            blk_in_count = blk_offs < topK
+            tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
+            tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
+            tok_clamped = blk_offs
+
             scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
             for d_start in range(0, D, BLOCK_D):
                 d_offs = d_start + tl.arange(0, BLOCK_D)
@@ -412,15 +488,16 @@ def _sfa_kernel(
 
             m_blk_safe = tl.where(m_blk == float('-inf'), 0.0, m_blk)
             p_raw = tl.exp(scores - m_blk_safe[:, None])
-            # p_raw = tl.where(tok_valid[None, :], p_raw, 0.0)
+            p_raw = tl.where(tok_valid[None, :], p_raw, 0.0)
             l_chunk = tl.sum(p_raw, axis=1)
             l_i = l_i * alpha_old + l_chunk * alpha_new
+            l_safe = tl.where(l_i > 0.0, l_i, 1.0)
 
+            out_base = (b * S1 + s1) * N1 * D
             for dv_start in range(0, D, BLOCK_DV):
                 dv_offs = dv_start + tl.arange(0, BLOCK_DV)
                 dv_valid = dv_offs < D
-                # Load fp32_acc before V so the independent load can overlap
-                # with the previous iteration's fp32_acc store (load-order.md).
+                # Load fp32_acc before V to overlap with previous store.
                 acc_dv = tl.load(
                     fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
                     mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
@@ -428,90 +505,21 @@ def _sfa_kernel(
                     v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
                     mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
                 pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
-                acc_dv = acc_dv * alpha_old[:, None] + pv_tile
+                # Fuse normalization: write directly to out_ptr instead of
+                # fp32_acc_ptr, saving a full dv-tile GM read+write pass.
+                out_tile = (acc_dv * alpha_old[:, None] + pv_tile) / l_safe[:, None]
                 tl.store(
-                    fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
-                    acc_dv,
+                    out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
+                    out_tile.to(out_ptr.dtype.element_ty),
                     mask=g_valid[:, None] & dv_valid[None, :] & row_active)
 
             m_i = m_new
 
-        # Last k-block: compute scores/softmax as above, but fuse the
-        # fp32_acc normalization (divide by l_safe) and write directly to
-        # out_ptr.  Eliminates the separate post-loop dv-tile pass that
-        # reads fp32_acc back from GM (discrete_memory_access.md: eliminate
-        # redundant GM round-trips).
-        last_blk_start = topK - BLOCK_K
-        blk_offs = last_blk_start + tl.arange(0, BLOCK_K)
-        blk_in_count = blk_offs < topK
-        tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
-        tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
-        tok_clamped = tl.where(tok_valid, tok, 0)
-
-        scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
-        for d_start in range(0, D, BLOCK_D):
-            d_offs = d_start + tl.arange(0, BLOCK_D)
-            d_valid = d_offs < D
-            q_tile = tl.load(
-                q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
-                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
-            k_tile = tl.load(
-                k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
-                mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
-            scores += tl.dot(q_tile, tl.trans(k_tile))
-        for d_start in range(0, D_ROPE, BLOCK_D):
-            d_offs = d_start + tl.arange(0, BLOCK_D)
-            d_valid = d_offs < D_ROPE
-            qr_tile = tl.load(
-                qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
-                mask=g_valid[:, None] & d_valid[None, :], other=0.0)
-            kr_tile = tl.load(
-                kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + d_offs[None, :],
-                mask=tok_valid[:, None] & d_valid[None, :], other=0.0)
-            scores += tl.dot(qr_tile, tl.trans(kr_tile))
-        scores = scores * scale_value
-        scores = tl.where(tok_valid[None, :], scores, float('-inf'))
-
-        m_blk = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, m_blk)
-        m_new_safe = tl.where(m_new == float('-inf'), 0.0, m_new)
-        alpha_old = tl.exp(m_i - m_new_safe)
-        alpha_new = tl.exp(m_blk - m_new_safe)
-
-        m_blk_safe = tl.where(m_blk == float('-inf'), 0.0, m_blk)
-        p_raw = tl.exp(scores - m_blk_safe[:, None])
-        p_raw = tl.where(tok_valid[None, :], p_raw, 0.0)
-        l_chunk = tl.sum(p_raw, axis=1)
-        l_i = l_i * alpha_old + l_chunk * alpha_new
-        l_safe = tl.where(l_i > 0.0, l_i, 1.0)
-
-        out_base = (b * S1 + s1) * N1 * D
-        for dv_start in range(0, D, BLOCK_DV):
-            dv_offs = dv_start + tl.arange(0, BLOCK_DV)
-            dv_valid = dv_offs < D
-            # Load fp32_acc before V to overlap with previous store.
-            acc_dv = tl.load(
-                fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
-                mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
-            v_tile = tl.load(
-                v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
-                mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
-            pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
-            # Fuse normalization: write directly to out_ptr instead of
-            # fp32_acc_ptr, saving a full dv-tile GM read+write pass.
-            out_tile = (acc_dv * alpha_old[:, None] + pv_tile) / l_safe[:, None]
-            tl.store(
-                out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
-                out_tile.to(out_ptr.dtype.element_ty),
-                mask=g_valid[:, None] & dv_valid[None, :] & row_active)
-
-        m_i = m_new
-
-        if return_lse:
-            sm_base = (b * S1 + s1) * N1
-            store_mask = g_valid & row_active & (l_i > 0.0)
-            tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
-            tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
+            if return_lse:
+                sm_base = (b * S1 + s1) * N1
+                store_mask = g_valid & row_active & (l_i > 0.0)
+                tl.store(sm_max_ptr + sm_base + g_offs, m_i, mask=store_mask)
+                tl.store(sm_sum_ptr + sm_base + g_offs, l_i, mask=store_mask)
 
 
 def _sfa_core(
@@ -527,16 +535,14 @@ def _sfa_core(
     sparse_mode: int,
     return_lse: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # grid both dims pow2-padded (Ascend traps on non-pow2 grid); out-of-range
-    # programs idle via in_range masks. Padding must match _prune_configs.
-    def grid_fn(meta): return (
-        _next_pow2(B_S1),
-        _next_pow2(triton.cdiv(N1, meta["BLOCK_G"])),
-    )
+    # 1D flat grid: flatten (bs1, g) into a single dim, cap at _GRID_CAP to
+    # match NPU core count (32 cores × 32 programs/core = 1024). Each program
+    # loops over multiple work items when total_work > grid_size.
+    def grid_fn(meta):
+        grid_g = _next_pow2(triton.cdiv(N1, meta["BLOCK_G"]))
+        total_work = B_S1 * grid_g
+        return (_next_pow2(min(total_work, _GRID_CAP)),)
 
-    # fast path when one block (BLOCK_TOPK = pow2(topK), capped at 128) covers the
-    # whole sparse window: scores/P computed once, dv-tiled P@V. Larger topK uses
-    # chunked online-softmax (fp32 global accumulator, no two-pass recompute).
     block_topk = _next_pow2(topK)
     single_block = block_topk <= 128
 
@@ -555,5 +561,6 @@ def _sfa_core(
         return_lse=return_lse,
         SINGLE_BLOCK=single_block,
         BLOCK_TOPK=block_topk,
+        GRID_CAP=_GRID_CAP,
     )
     return out_buf, sm_max_buf, sm_sum_buf
