@@ -171,7 +171,6 @@ def _sfa_scores_block(
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # Wider BLOCK_K ranges
-        triton.Config({"BLOCK_G": 16, "BLOCK_K": 16, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         # Larger BLOCK_DV: fewer dv-tile iterations, fewer fp32_acc GM round-trips
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 64, "BLOCK_D": 64,  "BLOCK_DV": 128}),
@@ -202,6 +201,10 @@ def _sfa_scores_block(
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 64}),
         # BG=64 + BK=128 + BD=128 + BDV=128: full-head with wider dv tiles
         triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 128}),
+        # BG=64 full-head + large BDV=256: halve dv-tile iterations (D=512: 2 vs 4)
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 64,  "BLOCK_D": 128, "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 64,  "BLOCK_D": 64,  "BLOCK_DV": 256}),
+        triton.Config({"BLOCK_G": 64, "BLOCK_K": 128, "BLOCK_D": 64,  "BLOCK_DV": 128}),
         # BK=256 + BDV=128: fewer dv-tile iterations
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 128}),
         # More configs unlocked by phased UB estimator
@@ -211,9 +214,7 @@ def _sfa_scores_block(
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 256}),
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 128, "BLOCK_D": 256, "BLOCK_DV": 256}),
         # More configs unlocked by ub_multiplier=1.1
-        triton.Config({"BLOCK_G": 64, "BLOCK_K": 256, "BLOCK_D": 128, "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 8,  "BLOCK_K": 256, "BLOCK_D": 64,  "BLOCK_DV": 256}),
-        triton.Config({"BLOCK_G": 4,  "BLOCK_K": 128, "BLOCK_D": 128, "BLOCK_DV": 512}),
         # Extreme configs unlocked by ub_multiplier=1.0
         triton.Config({"BLOCK_G": 32, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 64}),
         triton.Config({"BLOCK_G": 16, "BLOCK_K": 512, "BLOCK_D": 64,  "BLOCK_DV": 128}),
