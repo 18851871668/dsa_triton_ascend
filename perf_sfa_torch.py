@@ -10,7 +10,6 @@ Run:
 from __future__ import annotations
 
 import csv
-import glob
 import os
 import sys
 import time
@@ -88,27 +87,24 @@ def run_timing():
     print(f"triton:  median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
 
 
-def _print_op_statistic(out_dir):
-    candidates = glob.glob(os.path.join(out_dir, "**", "op_statistic.csv"), recursive=True)
-    if not candidates:
-        print(f"No op_statistic.csv found under {out_dir}")
+def _print_kernel_details(out_dir):
+    path = os.path.join(out_dir, "ASCEND_PROFILER_OUTPUT", "kernel_details.csv")
+    if not os.path.isfile(path):
+        print(f"No kernel_details.csv found at {path}")
         return
-    path = candidates[0]
-    print(f"\n{'='*120}")
-    print(f"Op Statistics: {path}")
-    print(f"{'='*120}")
     with open(path, newline="") as f:
-        reader = csv.reader(f)
-        rows = [r for r in reader]
+        reader = csv.DictReader(f)
+        rows = [r for r in reader if r.get("Name", "").startswith("_sfa_kernel")]
     if not rows:
-        print("(empty)")
+        print("No _sfa_kernel rows found in kernel_details.csv")
         return
-    widths = [0] * len(rows[0])
+    durations = [float(r["Duration(us)"]) for r in rows if r.get("Duration(us)")]
+    avg_us = sum(durations) / len(durations)
+    print(f"\n{'='*80}")
+    print(f"_sfa_kernel: {len(rows)} calls, avg={avg_us:.2f}us ({avg_us/1000:.3f}ms)")
+    print(f"{'='*80}")
     for r in rows:
-        for i, v in enumerate(r):
-            widths[i] = max(widths[i], len(v))
-    for r in rows:
-        print("  ".join(v.ljust(widths[i]) for i, v in enumerate(r)))
+        print(f"  {r.get('Name','')}  {r.get('Duration(us)','')}us")
 
 
 def run_profiling():
@@ -126,7 +122,7 @@ def run_profiling():
             prof.step()
     _synchronize()
     print(f"Profiler data saved to {out_dir}")
-    _print_op_statistic(out_dir)
+    _print_kernel_details(out_dir)
 
 
 def run_kernel_only():
