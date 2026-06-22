@@ -295,12 +295,12 @@ def _sfa_kernel(
         pid_g = work_id % grid_g
 
         bs1_in_range = pid_bs1 < B_S1
-        pid_bs1 = tl.where(bs1_in_range, pid_bs1, 0)
+        pid_bs1 = tl.where(bs1_in_range, pid_bs1, 0).to(tl.int32)
 
         b = pid_bs1 // S1
         s1 = pid_bs1 % S1
 
-        g_offs = pid_g * BLOCK_G + tl.arange(0, BLOCK_G)
+        g_offs = (pid_g * BLOCK_G + tl.arange(0, BLOCK_G)).to(tl.int32)
         g_valid = g_offs < N1
 
         act_q = tl.load(act_q_ptr + b)
