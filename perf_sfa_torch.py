@@ -5,9 +5,13 @@ Run:
     python perf_sfa_torch.py                  # timing (median/p20/p80)
     python perf_sfa_torch.py --autotune-confirm
     python perf_sfa_torch.py --kernel-only
+    python perf_sfa_torch.py --prof           # torch_npu profiler + op_statistic
 """
 from __future__ import annotations
 
+import csv
+import glob
+import os
 import sys
 import time
 
@@ -84,6 +88,47 @@ def run_timing():
     print(f"triton:  median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
 
 
+def _print_op_statistic(out_dir):
+    candidates = glob.glob(os.path.join(out_dir, "**", "op_statistic.csv"), recursive=True)
+    if not candidates:
+        print(f"No op_statistic.csv found under {out_dir}")
+        return
+    path = candidates[0]
+    print(f"\n{'='*120}")
+    print(f"Op Statistics: {path}")
+    print(f"{'='*120}")
+    with open(path, newline="") as f:
+        reader = csv.reader(f)
+        rows = [r for r in reader]
+    if not rows:
+        print("(empty)")
+        return
+    widths = [0] * len(rows[0])
+    for r in rows:
+        for i, v in enumerate(r):
+            widths[i] = max(widths[i], len(v))
+    for r in rows:
+        print("  ".join(v.ljust(widths[i]) for i, v in enumerate(r)))
+
+
+def run_profiling():
+    import torch_npu.profiler as npu_prof
+    q, k, qr, kr, si, scale = _build()
+    out_dir = "./profiler_data_sfa_torch"
+    total_steps = 10
+    with npu_prof.profile(
+        activities=[npu_prof.ProfilerActivity.CPU, npu_prof.ProfilerActivity.NPU],
+        schedule=npu_prof.schedule(wait=2, warmup=2, active=4, repeat=1, skip_first=2),
+        on_trace_ready=npu_prof.tensorboard_trace_handler(out_dir),
+    ) as prof:
+        for _ in range(total_steps):
+            run_sfa(q, k, qr, kr, si, 1, SPARSE_MODE, scale, return_lse=True)
+            prof.step()
+    _synchronize()
+    print(f"Profiler data saved to {out_dir}")
+    _print_op_statistic(out_dir)
+
+
 def run_kernel_only():
     q, k, qr, kr, si, scale = _build()
     for _ in range(10):
@@ -100,5 +145,7 @@ if __name__ == "__main__":
         run_kernel_only()
     elif mode == "--autotune-confirm":
         run_autotune_confirm()
+    elif mode == "--prof":
+        run_profiling()
     else:
         run_timing()
