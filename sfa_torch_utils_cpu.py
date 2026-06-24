@@ -71,10 +71,7 @@ def expand_block_indices(sparse_indices, sparse_block_size):
     return tokens.reshape(*lead, topK * bs)
 
 
-def run_sfa(q, k, qr, kr, sparse_indices, sparse_block_size, sparse_mode,
-            scale_value, return_lse):
-    from sfa_core_standalone import _sfa_core
-    device = q.device
+def prepare_sfa_inputs(q, k, qr, kr, sparse_indices, sparse_block_size):
     B, S1, N1, D = q.shape
     S2 = k.shape[1]
     si_tok = expand_block_indices(sparse_indices, sparse_block_size)
@@ -91,7 +88,51 @@ def run_sfa(q, k, qr, kr, sparse_indices, sparse_block_size, sparse_mode,
     kr_gathered = torch.index_select(kr_flat, 0, sparse_1d).reshape(B * S1, topK, D_ROPE).contiguous()
     v_gathered = k_gathered
 
+    return q_flat, qr_flat, k_gathered, kr_gathered, v_gathered, sparse_flat, B, S1, S2, N1, topK, D
+
+
+def prepare_sfa_inputs_cpu(q, k, qr, kr, sparse_indices, sparse_block_size, device=DEVICE):
+    q_flat, qr_flat, k_gathered, kr_gathered, v_gathered, sparse_flat, B, S1, S2, N1, topK, D = \
+        prepare_sfa_inputs(q, k, qr, kr, sparse_indices, sparse_block_size)
+    q_flat = q_flat.to(device)
+    qr_flat = qr_flat.to(device)
+    k_gathered = k_gathered.to(device)
+    kr_gathered = kr_gathered.to(device)
+    v_gathered = v_gathered.to(device)
+    sparse_flat = sparse_flat.to(device)
+    return q_flat, qr_flat, k_gathered, kr_gathered, v_gathered, sparse_flat, B, S1, S2, N1, topK, D
+
+
+def run_sfa(q, k, qr, kr, sparse_indices, sparse_block_size, sparse_mode,
+            scale_value, return_lse):
+    from sfa_core_standalone import _sfa_core
+    device = q.device
+    q_flat, qr_flat, k_gathered, kr_gathered, v_gathered, sparse_flat, B, S1, S2, N1, topK, D = \
+        prepare_sfa_inputs(q, k, qr, kr, sparse_indices, sparse_block_size)
+
     out_buf = torch.zeros((B, S1, N1, D), dtype=q.dtype, device=device)
+    sm_max_buf = torch.zeros((B, 1, S1, N1), dtype=torch.float32, device=device)
+    sm_sum_buf = torch.zeros((B, 1, S1, N1), dtype=torch.float32, device=device)
+    fp32_acc_buf = torch.zeros((B, S1, N1, D), dtype=torch.float32, device=device)
+
+    act_q = torch.full((B,), S1, dtype=torch.int32, device=device)
+    act_k = torch.full((B,), S2, dtype=torch.int32, device=device)
+
+    out, smax, ssum = _sfa_core(
+        q_flat, qr_flat, k_gathered, kr_gathered, v_gathered, sparse_flat,
+        out_buf, sm_max_buf, sm_sum_buf, fp32_acc_buf,
+        act_q, act_k,
+        B * S1, S1, S2, N1, topK, D, D_ROPE,
+        float(scale_value), sparse_mode, 1 if return_lse else 0,
+    )
+    return out, smax, ssum
+
+
+def run_sfa_kernel(q_flat, qr_flat, k_gathered, kr_gathered, v_gathered, sparse_flat,
+                   B, S1, S2, N1, topK, D, scale_value, sparse_mode, return_lse):
+    from sfa_core_standalone import _sfa_core
+    device = q_flat.device
+    out_buf = torch.zeros((B, S1, N1, D), dtype=q_flat.dtype, device=device)
     sm_max_buf = torch.zeros((B, 1, S1, N1), dtype=torch.float32, device=device)
     sm_sum_buf = torch.zeros((B, 1, S1, N1), dtype=torch.float32, device=device)
     fp32_acc_buf = torch.zeros((B, S1, N1, D), dtype=torch.float32, device=device)

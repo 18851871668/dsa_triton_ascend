@@ -18,7 +18,8 @@ import numpy as np
 import torch
 
 from sfa_torch_utils_cpu import (
-    D_ROPE, DEVICE, make_inputs, make_sparse_indices, run_sfa, to_device,
+    D_ROPE, DEVICE, make_inputs, make_sparse_indices, run_sfa, run_sfa_kernel,
+    prepare_sfa_inputs_cpu, to_device,
 )
 
 D_NOPE = 512
@@ -71,37 +72,40 @@ def _build():
     return q, k, qr, kr, si, scale
 
 
-def _upload(q, k, qr, kr, si):
-    q, k, qr, kr = to_device(q, k, qr, kr)
-    si = si.to(DEVICE)
-    return q, k, qr, kr, si
+def _prepare(q, k, qr, kr, si):
+    q_flat, qr_flat, k_gathered, kr_gathered, v_gathered, sparse_flat, _, _, S2, _, topK, D = \
+        prepare_sfa_inputs_cpu(q, k, qr, kr, si, 1)
+    return q_flat, qr_flat, k_gathered, kr_gathered, v_gathered, sparse_flat, S2, topK, D
 
 
 def run_autotune_confirm():
     q, k, qr, kr, si, scale = _build()
-    q, k, qr, kr, si = _upload(q, k, qr, kr, si)
+    q_flat, qr_flat, k_g, kr_g, v_g, sp_flat, S2, topK, D = _prepare(q, k, qr, kr, si)
     print(f"\nShape: B={B}, S1={S1}, S2={S2}, N1={N1}, topK={SPARSE_COUNT}, D={D_NOPE}")
     print("Running 1 invocation to trigger autotune — TRITON_PRINT_AUTOTUNING=1 output in stderr")
     print("=" * 80)
-    out, smax, ssum = run_sfa(q, k, qr, kr, si, 1, SPARSE_MODE, scale, return_lse=True)
+    out, smax, ssum = run_sfa_kernel(q_flat, qr_flat, k_g, kr_g, v_g, sp_flat,
+                                     B, S1, S2, N1, topK, D, scale, SPARSE_MODE, return_lse=True)
     _synchronize()
     print(f"Autotune done. Output[0] shape: {tuple(out.shape)}")
 
 
 def run_timing():
     q, k, qr, kr, si, scale = _build()
-    q, k, qr, kr, si = _upload(q, k, qr, kr, si)
+    q_flat, qr_flat, k_g, kr_g, v_g, sp_flat, S2, topK, D = _prepare(q, k, qr, kr, si)
     print(f"\nB={B}, S1={S1}, S2={S2}, N1={N1}, topk={SPARSE_COUNT}, D={D_NOPE}, dtype={DTYPE}")
     t_med, t_p20, t_p80 = _do_bench(
-        lambda: run_sfa(q, k, qr, kr, si, 1, SPARSE_MODE, scale, return_lse=True))
+        lambda: run_sfa_kernel(q_flat, qr_flat, k_g, kr_g, v_g, sp_flat,
+                               B, S1, S2, N1, topK, D, scale, SPARSE_MODE, return_lse=True))
     print(f"triton:  median={t_med:.2f}ms, p20={t_p20:.2f}ms, p80={t_p80:.2f}ms")
 
 
 def run_kernel_only():
     q, k, qr, kr, si, scale = _build()
-    q, k, qr, kr, si = _upload(q, k, qr, kr, si)
+    q_flat, qr_flat, k_g, kr_g, v_g, sp_flat, S2, topK, D = _prepare(q, k, qr, kr, si)
     for _ in range(10):
-        run_sfa(q, k, qr, kr, si, 1, SPARSE_MODE, scale, return_lse=True)
+        run_sfa_kernel(q_flat, qr_flat, k_g, kr_g, v_g, sp_flat,
+                       B, S1, S2, N1, topK, D, scale, SPARSE_MODE, return_lse=True)
     _synchronize()
     print("kernel-only run finished")
 
