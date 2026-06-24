@@ -82,7 +82,10 @@ def run_sfa(q, k, qr, kr, sparse_indices, sparse_block_size, sparse_mode,
     # kernel access. Invalid indices (-1) are clamped to 0; the kernel masks
     # them via tok_valid so gathered data at index 0 is never used in results.
     # Use torch.index_select (8.8x faster than fancy indexing on NPU).
-    sparse_1d = sparse_flat.clamp(min=0).reshape(-1)    # [B*S1*topK]
+    # Add batch offset (b*S2) to per-batch sparse indices for global k_flat[B*S2, D].
+    batch_offsets = torch.arange(B, dtype=torch.int32, device=device) * S2  # [B]
+    sparse_global = sparse_flat.reshape(B, S1, topK) + batch_offsets.reshape(B, 1, 1)
+    sparse_1d = sparse_global.reshape(-1).clamp(min=0)   # [B*S1*topK]
     k_gathered = torch.index_select(k_flat, 0, sparse_1d).reshape(B * S1, topK, D).contiguous()
     kr_gathered = torch.index_select(kr_flat, 0, sparse_1d).reshape(B * S1, topK, D_ROPE).contiguous()
     v_gathered = k_gathered                              # MLA-absorb: V=K
