@@ -324,7 +324,7 @@ def _sfa_kernel(
         blk_in_count = blk_offs < topK
         tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
         tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
-        tok_clamped = tl.where(tok_valid, tok, 0)
+        tok_clamped = blk_offs
 
         scores = _sfa_scores_block(
             q_ptr, q_base, qr_ptr, qr_base,
@@ -374,7 +374,7 @@ def _sfa_kernel(
             blk_in_count = blk_offs < topK
             tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
             tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
-            tok_clamped = tl.where(tok_valid, tok, 0)
+            tok_clamped = blk_offs
 
             # Inline score computation (inlined from _sfa_scores_block) so the
             # compiler sees the full loop structure and can detect that Q/QR
@@ -447,7 +447,7 @@ def _sfa_kernel(
         blk_in_count = blk_offs < topK
         tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
         tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
-        tok_clamped = tl.where(tok_valid, tok, 0)
+        tok_clamped = blk_offs
 
         scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
         for d_start in range(0, D, BLOCK_D):
