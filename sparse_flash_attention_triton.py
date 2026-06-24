@@ -179,16 +179,14 @@ def _prune_configs(configs, named_args, **kwargs):
 def _sfa_scores_block(
     q_ptr, q_base, qr_ptr, qr_base,
     k_ptr, k_base, kr_ptr, kr_base,
-    tok_clamped, tok_valid, g_offs, g_valid,
+    blk_offs, tok_valid, g_offs, g_valid,
     scale_value: tl.constexpr, D: tl.constexpr, D_ROPE: tl.constexpr,
-    B_S2: tl.constexpr,
     BLOCK_G: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
     """scores[BLOCK_G, BLOCK_K] = (q_nope·k_nope + q_rope·k_rope) * scale.
 
     Shared by both passes; recomputed (not cached) so the kernel keeps no large
     resident buffer. Invalid gathered tokens are masked to -inf.
-    K/KR layout is transposed [D, B*S2] so no tl.trans needed.
     """
     scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
     for d_start in range(0, D, BLOCK_D):
@@ -199,10 +197,10 @@ def _sfa_scores_block(
             mask=g_valid[:, None] & d_valid[None, :], other=0.0,
             care_padding=False)
         k_tile = tl.load(
-            k_ptr + k_base + d_offs[:, None] * B_S2 + tok_clamped[None, :],
-            mask=d_valid[:, None] & tok_valid[None, :], other=0.0,
+            k_ptr + k_base + blk_offs[:, None] * D + d_offs[None, :],
+            mask=d_valid[None, :], other=0.0,
             care_padding=False)
-        scores += tl.dot(q_tile, k_tile)
+        scores += tl.dot(q_tile, tl.trans(k_tile))
     for d_start in range(0, D_ROPE, BLOCK_D):
         d_offs = d_start + tl.arange(0, BLOCK_D)
         d_valid = d_offs < D_ROPE
@@ -211,10 +209,10 @@ def _sfa_scores_block(
             mask=g_valid[:, None] & d_valid[None, :], other=0.0,
             care_padding=False)
         kr_tile = tl.load(
-            kr_ptr + kr_base + d_offs[:, None] * B_S2 + tok_clamped[None, :],
-            mask=d_valid[:, None] & tok_valid[None, :], other=0.0,
+            kr_ptr + kr_base + blk_offs[:, None] * D_ROPE + d_offs[None, :],
+            mask=d_valid[None, :], other=0.0,
             care_padding=False)
-        scores += tl.dot(qr_tile, kr_tile)
+        scores += tl.dot(qr_tile, tl.trans(kr_tile))
     scores = scores * scale_value
     return tl.where(tok_valid[None, :], scores, float('-inf'))
 
@@ -311,7 +309,7 @@ def _sfa_kernel(
     fp32_acc_ptr,                        # fp32 accumulator [B,S1,N1,D] for chunked path
     act_q_ptr, act_k_ptr,
     S2, N1, topK,
-    B_S1: tl.constexpr, S1: tl.constexpr, B_S2: tl.constexpr,
+    B_S1: tl.constexpr, S1: tl.constexpr,
     D: tl.constexpr, D_ROPE: tl.constexpr,
     scale_value,
     sparse_mode: tl.constexpr,
@@ -378,12 +376,12 @@ def _sfa_kernel(
     # rightDownCausal: leading rows (query longer than key) are fully hidden.
     row_active = bs1_in_range & (s1 < act_q) & (threshold > 0)
 
-    # base offsets (q[B,S1,N1,D], v[B,S2,1,D]; k/kr transposed [D,B*S2])
+    # base offsets (q/qr: [B,S1,N1,D]; k/kr/v: pre-gathered [B*S1,topK,D])
     q_base = (b * S1 + s1) * N1 * D
     qr_base = (b * S1 + s1) * N1 * D_ROPE
-    k_base = b * B_S2
-    kr_base = b * B_S2
-    v_base = b * S2 * D
+    k_base = pid_bs1 * topK * D
+    kr_base = pid_bs1 * topK * D_ROPE
+    v_base = pid_bs1 * topK * D
     sp_base = (b * S1 + s1) * topK
 
     if SINGLE_BLOCK:
@@ -394,13 +392,11 @@ def _sfa_kernel(
         blk_in_count = blk_offs < topK
         tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
         tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
-        tok_clamped = blk_offs
-
         scores = _sfa_scores_block(
             q_ptr, q_base, qr_ptr, qr_base,
             k_ptr, k_base, kr_ptr, kr_base,
-            tok_clamped, tok_valid, g_offs, g_valid,
-            scale_value, D, D_ROPE, B_S2, BLOCK_G, BLOCK_TOPK, BLOCK_D)
+            blk_offs, tok_valid, g_offs, g_valid,
+            scale_value, D, D_ROPE, BLOCK_G, BLOCK_TOPK, BLOCK_D)
 
         m_i = tl.max(scores, axis=1)
         m_safe = tl.where(m_i == float('-inf'), 0.0, m_i)
@@ -415,8 +411,8 @@ def _sfa_kernel(
             dv_offs = dv_start + tl.arange(0, BLOCK_DV)
             dv_valid = dv_offs < D
             v_tile = tl.load(
-                v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
-                mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
+                v_ptr + v_base + blk_offs[:, None] * D + dv_offs[None, :],
+                mask=dv_valid[None, :], other=0.0)
             out_tile = tl.dot(p_norm.to(v_tile.dtype), v_tile)
             tl.store(
                 out_ptr + out_base + g_offs[:, None] * D + dv_offs[None, :],
@@ -444,12 +440,10 @@ def _sfa_kernel(
             blk_in_count = blk_offs < topK
             tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
             tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
-            tok_clamped = blk_offs
-
             # Inline score computation (inlined from _sfa_scores_block) so the
             # compiler sees the full loop structure and can detect that Q/QR
             # loads are loop-invariant across blk_start iterations.
-            # Load order: Q before K (Q has no dep on tok_clamped, can overlap
+            # Load order: Q before K (Q has no dep on blk_offs, can overlap
             # with prev iter's fp32_acc store per load-order.md).
             scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
             for d_start in range(0, D, BLOCK_D):
@@ -459,9 +453,9 @@ def _sfa_kernel(
                     q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
                     mask=g_valid[:, None] & d_valid[None, :], other=0.0)
                 k_tile = tl.load(
-                    k_ptr + k_base + d_offs[:, None] * B_S2 + tok_clamped[None, :],
-                    mask=d_valid[:, None] & tok_valid[None, :], other=0.0)
-                scores += tl.dot(q_tile, k_tile)
+                    k_ptr + k_base + blk_offs[:, None] * D + d_offs[None, :],
+                    mask=d_valid[None, :], other=0.0)
+                scores += tl.dot(q_tile, tl.trans(k_tile))
             for d_start in range(0, D_ROPE, BLOCK_D):
                 d_offs = d_start + tl.arange(0, BLOCK_D)
                 d_valid = d_offs < D_ROPE
@@ -469,9 +463,9 @@ def _sfa_kernel(
                     qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
                     mask=g_valid[:, None] & d_valid[None, :], other=0.0)
                 kr_tile = tl.load(
-                    kr_ptr + kr_base + d_offs[:, None] * B_S2 + tok_clamped[None, :],
-                    mask=d_valid[:, None] & tok_valid[None, :], other=0.0)
-                scores += tl.dot(qr_tile, kr_tile)
+                    kr_ptr + kr_base + blk_offs[:, None] * D_ROPE + d_offs[None, :],
+                    mask=d_valid[None, :], other=0.0)
+                scores += tl.dot(qr_tile, tl.trans(kr_tile))
             scores = scores * scale_value
             scores = tl.where(tok_valid[None, :], scores, float('-inf'))
 
@@ -496,8 +490,8 @@ def _sfa_kernel(
                     fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
                     mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
                 v_tile = tl.load(
-                    v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
-                    mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
+                    v_ptr + v_base + blk_offs[:, None] * D + dv_offs[None, :],
+                    mask=dv_valid[None, :], other=0.0)
                 pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
                 acc_dv = acc_dv * alpha_old[:, None] + pv_tile
                 tl.store(
@@ -517,8 +511,6 @@ def _sfa_kernel(
         blk_in_count = blk_offs < topK
         tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
         tok_valid = blk_in_count & (tok != -1) & (tok < threshold) & (tok < act_k) & row_active
-        tok_clamped = blk_offs
-
         scores = tl.zeros([BLOCK_G, BLOCK_K], dtype=tl.float32)
         for d_start in range(0, D, BLOCK_D):
             d_offs = d_start + tl.arange(0, BLOCK_D)
@@ -527,9 +519,9 @@ def _sfa_kernel(
                 q_ptr + q_base + g_offs[:, None] * D + d_offs[None, :],
                 mask=g_valid[:, None] & d_valid[None, :], other=0.0)
             k_tile = tl.load(
-                k_ptr + k_base + d_offs[:, None] * B_S2 + tok_clamped[None, :],
-                mask=d_valid[:, None] & tok_valid[None, :], other=0.0)
-            scores += tl.dot(q_tile, k_tile)
+                k_ptr + k_base + blk_offs[:, None] * D + d_offs[None, :],
+                mask=d_valid[None, :], other=0.0)
+            scores += tl.dot(q_tile, tl.trans(k_tile))
         for d_start in range(0, D_ROPE, BLOCK_D):
             d_offs = d_start + tl.arange(0, BLOCK_D)
             d_valid = d_offs < D_ROPE
@@ -537,9 +529,9 @@ def _sfa_kernel(
                 qr_ptr + qr_base + g_offs[:, None] * D_ROPE + d_offs[None, :],
                 mask=g_valid[:, None] & d_valid[None, :], other=0.0)
             kr_tile = tl.load(
-                kr_ptr + kr_base + d_offs[:, None] * B_S2 + tok_clamped[None, :],
-                mask=d_valid[:, None] & tok_valid[None, :], other=0.0)
-            scores += tl.dot(qr_tile, kr_tile)
+                kr_ptr + kr_base + blk_offs[:, None] * D_ROPE + d_offs[None, :],
+                mask=d_valid[None, :], other=0.0)
+            scores += tl.dot(qr_tile, tl.trans(kr_tile))
         scores = scores * scale_value
         scores = tl.where(tok_valid[None, :], scores, float('-inf'))
 
@@ -565,8 +557,8 @@ def _sfa_kernel(
                 fp32_acc_ptr + fp32_base + g_offs[:, None] * D + dv_offs[None, :],
                 mask=g_valid[:, None] & dv_valid[None, :], other=0.0)
             v_tile = tl.load(
-                v_ptr + v_base + tok_clamped[:, None] * D + dv_offs[None, :],
-                mask=tok_valid[:, None] & dv_valid[None, :], other=0.0)
+                v_ptr + v_base + blk_offs[:, None] * D + dv_offs[None, :],
+                mask=dv_valid[None, :], other=0.0)
             pv_tile = tl.dot(p_raw.to(v_tile.dtype), v_tile) * alpha_new[:, None]
             # Fuse normalization: write directly to out_ptr instead of
             # fp32_acc_ptr, saving a full dv-tile GM read+write pass.
@@ -824,7 +816,7 @@ def _sfa_core(
         fp32_acc_buf,
         act_q, act_k,
         S2, N1, topK,
-        B_S1=B_S1, S1=S1, B_S2=(B_S1 // S1) * S2,
+        B_S1=B_S1, S1=S1,
         D=D, D_ROPE=D_ROPE,
         scale_value=scale_value,
         sparse_mode=sparse_mode,
@@ -965,10 +957,12 @@ def sparse_flash_attention_triton(
     qr_flat = qr_bsnd.contiguous()
     k_flat = k_bsnd.reshape(B * S2, D).contiguous()
     kr_flat = kr_bsnd.reshape(B * S2, D_ROPE).contiguous()
-    v_flat = k_flat
-    k_t_flat = k_bsnd.reshape(B * S2, D).t().contiguous()
-    kr_t_flat = kr_bsnd.reshape(B * S2, D_ROPE).t().contiguous()
     sparse_flat = si_tok.reshape(B * S1, topK).to(ms.int32).contiguous()
+
+    sparse_1d = sparse_flat.clamp(min=0).reshape(-1)
+    k_gathered = ms.ops.gather(k_flat, sparse_1d, axis=0).reshape(B * S1, topK, D).contiguous()
+    kr_gathered = ms.ops.gather(kr_flat, sparse_1d, axis=0).reshape(B * S1, topK, D_ROPE).contiguous()
+    v_gathered = k_gathered
 
     # Output buffers must live on-device; mint.zeros defaults to CPU, which makes
     # triton reject the pointer ("cannot be accessed from Triton (cpu tensor?)").
@@ -979,7 +973,7 @@ def sparse_flash_attention_triton(
 
     out_buf, sm_max_buf, sm_sum_buf = _sfa_core(
         q_flat, qr_flat,
-        k_t_flat, kr_t_flat, v_flat,
+        k_gathered, kr_gathered, v_gathered,
         sparse_flat,
         out_buf, sm_max_buf, sm_sum_buf,
         fp32_acc_buf,
