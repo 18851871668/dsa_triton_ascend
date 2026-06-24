@@ -84,10 +84,12 @@ def run_sfa(q, k, qr, kr, sparse_indices, sparse_block_size, sparse_mode,
     qr_flat = qr.contiguous()
     k_flat = k.reshape(B * S2, D).contiguous()
     kr_flat = kr.reshape(B * S2, D_ROPE).contiguous()
-    v_flat = k_flat
-    k_t_flat = k.reshape(B * S2, D).t().contiguous()
-    kr_t_flat = kr.reshape(B * S2, D_ROPE).t().contiguous()
     sparse_flat = si_tok.reshape(B * S1, topK).to(torch.int32).contiguous()
+
+    sparse_1d = sparse_flat.clamp(min=0).reshape(-1)
+    k_gathered = torch.index_select(k_flat, 0, sparse_1d).reshape(B * S1, topK, D).contiguous()
+    kr_gathered = torch.index_select(kr_flat, 0, sparse_1d).reshape(B * S1, topK, D_ROPE).contiguous()
+    v_gathered = k_gathered
 
     out_buf = torch.zeros((B, S1, N1, D), dtype=q.dtype, device=device)
     sm_max_buf = torch.zeros((B, 1, S1, N1), dtype=torch.float32, device=device)
@@ -98,7 +100,7 @@ def run_sfa(q, k, qr, kr, sparse_indices, sparse_block_size, sparse_mode,
     act_k = torch.full((B,), S2, dtype=torch.int32, device=device)
 
     out, smax, ssum = _sfa_core(
-        q_flat, qr_flat, k_t_flat, kr_t_flat, v_flat, sparse_flat,
+        q_flat, qr_flat, k_gathered, kr_gathered, v_gathered, sparse_flat,
         out_buf, sm_max_buf, sm_sum_buf, fp32_acc_buf,
         act_q, act_k,
         B * S1, S1, S2, N1, topK, D, D_ROPE,
