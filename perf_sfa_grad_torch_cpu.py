@@ -20,8 +20,7 @@ import numpy as np
 import torch
 
 from sfa_torch_utils_cpu import (
-    D_ROPE, DEVICE, make_inputs, make_sparse_indices, run_sfa, to_device,
-    prepare_sfa_inputs, run_sfa_kernel,
+    D_ROPE, DEVICE, make_inputs, make_sparse_indices, to_device,
 )
 from sfa_grad_torch_utils_cpu import (
     make_dout, prepare_sfa_grad_inputs_cpu, run_sfa_grad_kernel,
@@ -80,16 +79,19 @@ def _build():
 
 
 def _run_fwd(q, k, qr, kr, si, scale):
-    # 1. CPU: prepare inputs (index_select gather, reshape, contiguous)
-    q_f, qr_f, k_g, kr_g, v_g, sp_f, _, _, S2_, _, topK, D_ = \
-        prepare_sfa_inputs(q, k, qr, kr, si, 1)
-    # 2. Move only flat kernel inputs to NPU
-    q_f, qr_f, k_g, kr_g, v_g, sp_f = to_device(q_f, qr_f, k_g, kr_g, v_g, sp_f)
-    # 3. NPU: kernel only (run_sfa_kernel takes pre-prepared flat tensors)
-    out, smax, ssum = run_sfa_kernel(q_f, qr_f, k_g, kr_g, v_g, sp_f,
-                                     B, S1, S2_, N1, topK, D_, scale,
-                                     SPARSE_MODE, return_lse=True)
-    _synchronize()
+    # Numpy golden forward (CPU only, no triton kernel) to avoid autotune
+    # in simulator mode. Produces out/smax/ssum for the backward kernel.
+    from sparse_flash_attention_numpy import sparse_flash_attention_golden_bsnd, BF16
+    np_dtype = BF16 if DTYPE == torch.bfloat16 else np.float16
+    out_np, smax_np, ssum_np = sparse_flash_attention_golden_bsnd(
+        q.float().numpy(), k.float().numpy(), k.float().numpy(),
+        si.numpy(), qr.float().numpy(), kr.float().numpy(),
+        scale, [S1] * B, [S2] * B,
+        sparse_block_size=1, sparse_mode=SPARSE_MODE,
+        return_softmax_lse=True, dtype=np_dtype)
+    out = torch.from_numpy(out_np).to(DTYPE).to(DEVICE)
+    smax = torch.from_numpy(smax_np).to(DEVICE)
+    ssum = torch.from_numpy(ssum_np).to(DEVICE)
     return out, smax, ssum
 
 
