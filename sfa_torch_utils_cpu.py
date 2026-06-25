@@ -83,7 +83,10 @@ def prepare_sfa_inputs(q, k, qr, kr, sparse_indices, sparse_block_size):
     kr_flat = kr.reshape(B * S2, D_ROPE).contiguous()
     sparse_flat = si_tok.reshape(B * S1, topK).to(torch.int32).contiguous()
 
-    sparse_1d = sparse_flat.clamp(min=0).reshape(-1)
+    # Pre-gather K/KR with batch offset (b*S2) for global k_flat[B*S2, D].
+    batch_offsets = torch.arange(B, dtype=torch.int32, device=sparse_flat.device) * S2
+    sparse_global = sparse_flat.reshape(B, S1, topK) + batch_offsets.reshape(B, 1, 1)
+    sparse_1d = sparse_global.reshape(-1).clamp(min=0)
     k_gathered = torch.index_select(k_flat, 0, sparse_1d).reshape(B * S1, topK, D).contiguous()
     kr_gathered = torch.index_select(kr_flat, 0, sparse_1d).reshape(B * S1, topK, D_ROPE).contiguous()
     v_gathered = k_gathered

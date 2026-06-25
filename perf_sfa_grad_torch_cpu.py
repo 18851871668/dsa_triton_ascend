@@ -20,8 +20,8 @@ import numpy as np
 import torch
 
 from sfa_torch_utils_cpu import (
-    D_ROPE, DEVICE, make_inputs, make_sparse_indices, run_sfa_kernel,
-    prepare_sfa_inputs_cpu,
+    D_ROPE, DEVICE, make_inputs, make_sparse_indices, run_sfa, to_device,
+    prepare_sfa_inputs, run_sfa_kernel,
 )
 from sfa_grad_torch_utils_cpu import (
     make_dout, prepare_sfa_grad_inputs_cpu, run_sfa_grad_kernel,
@@ -79,11 +79,18 @@ def _build():
     return q, k, qr, kr, si, do, scale
 
 
-def _prepare_fwd(q, k, qr, kr, si):
-    # Flatten + gather forward inputs on CPU, move to NPU
-    q_flat, qr_flat, k_g, kr_g, v_g, sp_flat, _, _, S2, _, topK, D = \
-        prepare_sfa_inputs_cpu(q, k, qr, kr, si, 1)
-    return q_flat, qr_flat, k_g, kr_g, v_g, sp_flat, S2, topK, D
+def _run_fwd(q, k, qr, kr, si, scale):
+    # 1. CPU: prepare inputs (index_select gather, reshape, contiguous)
+    q_f, qr_f, k_g, kr_g, v_g, sp_f, _, _, S2_, _, topK, D_ = \
+        prepare_sfa_inputs(q, k, qr, kr, si, 1)
+    # 2. Move only flat kernel inputs to NPU
+    q_f, qr_f, k_g, kr_g, v_g, sp_f = to_device(q_f, qr_f, k_g, kr_g, v_g, sp_f)
+    # 3. NPU: kernel only (run_sfa_kernel takes pre-prepared flat tensors)
+    out, smax, ssum = run_sfa_kernel(q_f, qr_f, k_g, kr_g, v_g, sp_f,
+                                     B, S1, S2_, N1, topK, D_, scale,
+                                     SPARSE_MODE, return_lse=True)
+    _synchronize()
+    return out, smax, ssum
 
 
 def _prepare_bwd(q, k, qr, kr, si, do, out, smax, ssum):
@@ -98,12 +105,8 @@ def _prepare_bwd(q, k, qr, kr, si, do, out, smax, ssum):
 
 def run_timing():
     q, k, qr, kr, si, do, scale = _build()
-    # Forward: prepare on CPU, run on NPU to get out/smax/ssum
-    q_f, qr_f, k_g, kr_g, v_g, sp_f, S2_, topK, D_ = _prepare_fwd(q, k, qr, kr, si)
-    out, smax, ssum = run_sfa_kernel(q_f, qr_f, k_g, kr_g, v_g, sp_f,
-                                     B, S1, S2_, N1, topK, D_, scale,
-                                     SPARSE_MODE, return_lse=True)
-    _synchronize()
+    # Forward: move inputs to NPU, run on NPU to get out/smax/ssum
+    out, smax, ssum = _run_fwd(q, k, qr, kr, si, scale)
     # Backward: prepare on CPU+NPU, then benchmark kernel only
     bwd_inputs = _prepare_bwd(q, k, qr, kr, si, do, out, smax, ssum)
     q_flat, qr_flat, k_flat, kr_flat, v_flat, sparse_flat, \
@@ -152,11 +155,7 @@ def run_profiling():
     import torch_npu.profiler as npu_prof
     q, k, qr, kr, si, do, scale = _build()
     # Forward to get out/smax/ssum
-    q_f, qr_f, k_g, kr_g, v_g, sp_f, S2_, topK, D_ = _prepare_fwd(q, k, qr, kr, si)
-    out, smax, ssum = run_sfa_kernel(q_f, qr_f, k_g, kr_g, v_g, sp_f,
-                                     B, S1, S2_, N1, topK, D_, scale,
-                                     SPARSE_MODE, return_lse=True)
-    _synchronize()
+    out, smax, ssum = _run_fwd(q, k, qr, kr, si, scale)
     # Backward inputs
     bwd_inputs = _prepare_bwd(q, k, qr, kr, si, do, out, smax, ssum)
     q_flat, qr_flat, k_flat, kr_flat, v_flat, sparse_flat, \
@@ -205,11 +204,7 @@ def run_profiling():
 def run_kernel_only():
     q, k, qr, kr, si, do, scale = _build()
     # Forward to get out/smax/ssum
-    q_f, qr_f, k_g, kr_g, v_g, sp_f, S2_, topK, D_ = _prepare_fwd(q, k, qr, kr, si)
-    out, smax, ssum = run_sfa_kernel(q_f, qr_f, k_g, kr_g, v_g, sp_f,
-                                     B, S1, S2_, N1, topK, D_, scale,
-                                     SPARSE_MODE, return_lse=True)
-    _synchronize()
+    out, smax, ssum = _run_fwd(q, k, qr, kr, si, scale)
     # Backward inputs
     bwd_inputs = _prepare_bwd(q, k, qr, kr, si, do, out, smax, ssum)
     q_flat, qr_flat, k_flat, kr_flat, v_flat, sparse_flat, \

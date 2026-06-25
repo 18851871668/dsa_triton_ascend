@@ -23,7 +23,7 @@ def _next_pow2(x):
 
 def _select_block_config(D, N1):
     block_g = min(16, max(8, N1))
-    return {"BLOCK_G": block_g, "BLOCK_K": 32, "BLOCK_D": 128}
+    return {"BLOCK_G": block_g, "BLOCK_K": 32}
 
 
 @triton.jit
@@ -83,9 +83,13 @@ def _sfa_grad_kernel(
 
     # Base offsets (shared across all stages)
     sp_base = pid_bs1 * topK
-    k_base = b * S2 * D
-    kr_base = b * S2 * D_ROPE
-    v_base = b * S2 * D
+    # K/KR are pre-gathered on host into [B*S1, topK, *] contiguous buffer;
+    # kernel reads them sequentially via blk_offs (no random gather).
+    k_rd_base = pid_bs1 * topK * D
+    kr_rd_base = pid_bs1 * topK * D_ROPE
+    # dk/dkr/dv scatter-add back into original [B*S2, *] space via tok_clamped.
+    dk_wr_base = b * S2 * D
+    dkr_wr_base = b * S2 * D_ROPE
     dq_row_base = pid_bs1 * N1 * D       # [B*S1, N1, D]
     dqr_row_base = pid_bs1 * N1 * D_ROPE  # [B*S1, N1, D_ROPE]
 
@@ -144,11 +148,9 @@ def _sfa_grad_kernel(
             tok_clamped = tl.where(tok_valid, tok, 0)
 
             k_full = tl.load(
-                k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
-                mask=tok_valid[:, None], other=0.0)
+                k_ptr + k_rd_base + blk_offs[:, None] * D + d_offs[None, :])
             kr_full = tl.load(
-                kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + dr_offs[None, :],
-                mask=tok_valid[:, None], other=0.0)
+                kr_ptr + kr_rd_base + blk_offs[:, None] * D_ROPE + dr_offs[None, :])
 
             scores = tl.dot(q_nope, tl.trans(k_full)).to(tl.float32)
             scores += tl.dot(q_rope, tl.trans(kr_full)).to(tl.float32)
@@ -158,6 +160,7 @@ def _sfa_grad_kernel(
 
             dPv = tl.dot(do_tile, tl.trans(k_full)).to(tl.float32)
             dS = P * (dPv - delta[:, None]) * scale_value
+            dS = tl.where(tok_valid[None, :], dS, 0.0)
 
             acc_dq += tl.dot(dS.to(k_full.dtype), k_full).to(tl.float32)
             acc_dqr += tl.dot(dS.to(kr_full.dtype), kr_full).to(tl.float32)
@@ -187,11 +190,9 @@ def _sfa_grad_kernel(
 
         # Load k_full/kr_full once per blk_start (shared across all hc)
         k_full = tl.load(
-            k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
-            mask=tok_valid[:, None], other=0.0)
+            k_ptr + k_rd_base + blk_offs[:, None] * D + d_offs[None, :])
         kr_full = tl.load(
-            kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + dr_offs[None, :],
-            mask=tok_valid[:, None], other=0.0)
+            kr_ptr + kr_rd_base + blk_offs[:, None] * D_ROPE + dr_offs[None, :])
 
         dk_acc = tl.zeros([BLOCK_K, D], dtype=tl.float32)
         dkr_acc = tl.zeros([BLOCK_K, D_ROPE], dtype=tl.float32)
@@ -227,15 +228,16 @@ def _sfa_grad_kernel(
 
             dPv = tl.dot(do_tile, tl.trans(k_full)).to(tl.float32)
             dS = P * (dPv - delta[:, None]) * scale_value
+            dS = tl.where(tok_valid[None, :], dS, 0.0)
 
             dk_acc += tl.dot(tl.trans(dS).to(q_nope.dtype), q_nope).to(tl.float32)
             dkr_acc += tl.dot(tl.trans(dS).to(q_rope.dtype), q_rope).to(tl.float32)
 
         # Single atomic_add for dk (accumulated across all head chunks)
-        dk_offs = v_base + tok_clamped[:, None] * D + d_offs[None, :]
+        dk_offs = dk_wr_base + tok_clamped[:, None] * D + d_offs[None, :]
         tl.atomic_add(dk_ptr + dk_offs, dk_acc, mask=tok_valid[:, None])
 
-        dkr_offs = kr_base + tok_clamped[:, None] * D_ROPE + dr_offs[None, :]
+        dkr_offs = dkr_wr_base + tok_clamped[:, None] * D_ROPE + dr_offs[None, :]
         tl.atomic_add(dkr_ptr + dkr_offs, dkr_acc, mask=tok_valid[:, None])
 
     # ──────────────────────────────────────────────────────────────
@@ -256,11 +258,9 @@ def _sfa_grad_kernel(
         tok_clamped = tl.where(tok_valid, tok, 0)
 
         k_full = tl.load(
-            k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
-            mask=tok_valid[:, None], other=0.0)
+            k_ptr + k_rd_base + blk_offs[:, None] * D + d_offs[None, :])
         kr_full = tl.load(
-            kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + dr_offs[None, :],
-            mask=tok_valid[:, None], other=0.0)
+            kr_ptr + kr_rd_base + blk_offs[:, None] * D_ROPE + dr_offs[None, :])
 
         dv_acc = tl.zeros([BLOCK_K, D], dtype=tl.float32)
 
@@ -288,11 +288,12 @@ def _sfa_grad_kernel(
             scores = scores * scale_value
 
             P = tl.exp(scores - sm_max[:, None]) / sm_sum[:, None]
+            P = tl.where(tok_valid[None, :], P, 0.0)
 
             dv_acc += tl.dot(tl.trans(P).to(do_tile.dtype), do_tile).to(tl.float32)
 
         # Single atomic_add for dv
-        dv_offs = v_base + tok_clamped[:, None] * D + d_offs[None, :]
+        dv_offs = dk_wr_base + tok_clamped[:, None] * D + d_offs[None, :]
         tl.atomic_add(dv_ptr + dv_offs, dv_acc, mask=tok_valid[:, None])
 
 

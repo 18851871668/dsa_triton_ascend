@@ -14,8 +14,7 @@ import torch
 
 from sfa_torch_utils_cpu import (
     D_ROPE, DEVICE, make_inputs, make_sparse_indices,
-    expand_block_indices, to_device, run_sfa, run_sfa_kernel,
-    prepare_sfa_inputs_cpu, to_np_f32,
+    expand_block_indices, to_device, run_sfa,
 )
 
 
@@ -38,12 +37,20 @@ def prepare_sfa_grad_inputs(q, k, qr, kr, sparse_indices, do, out, smax, ssum,
     o_flat = out.contiguous()
     k_flat = k.reshape(B * S2, D).contiguous()
     kr_flat = kr.reshape(B * S2, D_ROPE).contiguous()
-    v_flat = k_flat
     sparse_flat = si_tok.reshape(B * S1, topK).to(torch.int32).contiguous()
     sm_max_flat = smax.reshape(B * S1 * N1).to(torch.float32).contiguous()
     sm_sum_flat = ssum.reshape(B * S1 * N1).to(torch.float32).contiguous()
 
-    return (q_flat, qr_flat, k_flat, kr_flat, v_flat, sparse_flat,
+    # Pre-gather K/KR into contiguous [B*S1, topK, *] for sequential kernel access.
+    dev = q_flat.device
+    batch_offsets = torch.arange(B, dtype=torch.int32, device=dev) * S2
+    sparse_global = sparse_flat.reshape(B, S1, topK) + batch_offsets.reshape(B, 1, 1)
+    sparse_1d = sparse_global.reshape(-1).clamp(min=0)
+    k_gathered = torch.index_select(k_flat, 0, sparse_1d).reshape(B * S1, topK, D).contiguous()
+    kr_gathered = torch.index_select(kr_flat, 0, sparse_1d).reshape(B * S1, topK, D_ROPE).contiguous()
+    v_gathered = k_gathered
+
+    return (q_flat, qr_flat, k_gathered, kr_gathered, v_gathered, sparse_flat,
             do_flat, o_flat, sm_max_flat, sm_sum_flat,
             B, S1, S2, N1, topK, D)
 
@@ -66,16 +73,23 @@ def prepare_sfa_grad_inputs_cpu(q, k, qr, kr, sparse_indices, do, out, smax, ssu
     do_flat = do.contiguous()
     k_flat = k.reshape(B * S2, D).contiguous()
     kr_flat = kr.reshape(B * S2, D_ROPE).contiguous()
-    v_flat = k_flat
     sparse_flat = si_tok.reshape(B * S1, topK).to(torch.int32).contiguous()
+
+    # Pre-gather K/KR on CPU (index_select is efficient on CPU too)
+    batch_offsets = torch.arange(B, dtype=torch.int32) * S2
+    sparse_global = sparse_flat.reshape(B, S1, topK) + batch_offsets.reshape(B, 1, 1)
+    sparse_1d = sparse_global.reshape(-1).clamp(min=0)
+    k_gathered = torch.index_select(k_flat, 0, sparse_1d).reshape(B * S1, topK, D).contiguous()
+    kr_gathered = torch.index_select(kr_flat, 0, sparse_1d).reshape(B * S1, topK, D_ROPE).contiguous()
+    v_gathered = k_gathered
 
     # Move CPU tensors to device
     q_flat = q_flat.to(device)
     qr_flat = qr_flat.to(device)
     do_flat = do_flat.to(device)
-    k_flat = k_flat.to(device)
-    kr_flat = kr_flat.to(device)
-    v_flat = k_flat
+    k_gathered = k_gathered.to(device)
+    kr_gathered = kr_gathered.to(device)
+    v_gathered = k_gathered
     sparse_flat = sparse_flat.to(device)
 
     # Reshape NPU tensors (already on device)
@@ -83,7 +97,7 @@ def prepare_sfa_grad_inputs_cpu(q, k, qr, kr, sparse_indices, do, out, smax, ssu
     sm_max_flat = smax.reshape(B * S1 * N1).to(torch.float32).contiguous()
     sm_sum_flat = ssum.reshape(B * S1 * N1).to(torch.float32).contiguous()
 
-    return (q_flat, qr_flat, k_flat, kr_flat, v_flat, sparse_flat,
+    return (q_flat, qr_flat, k_gathered, kr_gathered, v_gathered, sparse_flat,
             do_flat, o_flat, sm_max_flat, sm_sum_flat,
             B, S1, S2, N1, topK, D)
 

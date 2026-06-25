@@ -55,10 +55,18 @@ def run_sfa_grad(q, k, qr, kr, sparse_indices, do, out, smax, ssum,
     o_flat = out.contiguous()
     k_flat = k.reshape(B * S2, D).contiguous()
     kr_flat = kr.reshape(B * S2, D_ROPE).contiguous()
-    v_flat = k_flat
     sparse_flat = si_tok.reshape(B * S1, topK).to(torch.int32).contiguous()
     sm_max_flat = smax.reshape(B * S1 * N1).to(torch.float32).contiguous()
     sm_sum_flat = ssum.reshape(B * S1 * N1).to(torch.float32).contiguous()
+
+    # Pre-gather K/KR into contiguous [B*S1, topK, *] for sequential kernel
+    # access (same optimization as forward pregather-seq-kv).
+    batch_offsets = torch.arange(B, dtype=torch.int32, device=device) * S2
+    sparse_global = sparse_flat.reshape(B, S1, topK) + batch_offsets.reshape(B, 1, 1)
+    sparse_1d = sparse_global.reshape(-1).clamp(min=0)
+    k_gathered = torch.index_select(k_flat, 0, sparse_1d).reshape(B * S1, topK, D).contiguous()
+    kr_gathered = torch.index_select(kr_flat, 0, sparse_1d).reshape(B * S1, topK, D_ROPE).contiguous()
+    v_gathered = k_gathered
 
     dq_buf = torch.zeros((B, S1, N1, D), dtype=q.dtype, device=device)
     dqr_buf = torch.zeros((B, S1, N1, D_ROPE), dtype=qr.dtype, device=device)
@@ -70,7 +78,7 @@ def run_sfa_grad(q, k, qr, kr, sparse_indices, do, out, smax, ssum,
     act_k = torch.full((B,), S2, dtype=torch.int32, device=device)
 
     dq, dqr, dk, dkr, dv = _sfa_grad_core(
-        q_flat, qr_flat, k_flat, kr_flat, v_flat, sparse_flat,
+        q_flat, qr_flat, k_gathered, kr_gathered, v_gathered, sparse_flat,
         do_flat, o_flat, sm_max_flat, sm_sum_flat,
         dq_buf, dqr_buf, dk_buf, dkr_buf, dv_buf,
         act_q, act_k,
