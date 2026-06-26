@@ -362,15 +362,15 @@ def _sfa_grad_core(
 
     dk_contrib = ms.ops.bmm(ds_buf.reshape(B_S1, N1, topK).transpose(1, 2),
                             q_flat.reshape(B_S1, N1, D).astype(ms.float32))
-    dk_buf = ms.ops.index_add(dk_buf, 0, sparse_1d, dk_contrib.reshape(-1, D))
+    dk_buf = ms.ops.index_add(dk_buf, sparse_1d, dk_contrib.reshape(-1, D), 0)
 
     dv_contrib = ms.ops.bmm(dp_buf.reshape(B_S1, N1, topK).transpose(1, 2),
                             do_flat.reshape(B_S1, N1, D).astype(ms.float32))
-    dv_buf = ms.ops.index_add(dv_buf, 0, sparse_1d, dv_contrib.reshape(-1, D))
+    dv_buf = ms.ops.index_add(dv_buf, sparse_1d, dv_contrib.reshape(-1, D), 0)
 
     dkr_contrib = ms.ops.bmm(ds_buf.reshape(B_S1, N1, topK).transpose(1, 2),
                              qr_flat.reshape(B_S1, N1, D_ROPE).astype(ms.float32))
-    dkr_buf = ms.ops.index_add(dkr_buf, 0, sparse_1d, dkr_contrib.reshape(-1, D_ROPE))
+    dkr_buf = ms.ops.index_add(dkr_buf, sparse_1d, dkr_contrib.reshape(-1, D_ROPE), 0)
 
     return dq_buf, dqr_buf, dk_buf, dkr_buf, dv_buf
 
