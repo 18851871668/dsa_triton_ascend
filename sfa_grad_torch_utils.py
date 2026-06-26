@@ -59,8 +59,7 @@ def run_sfa_grad(q, k, qr, kr, sparse_indices, do, out, smax, ssum,
     sm_max_flat = smax.reshape(B * S1 * N1).to(torch.float32).contiguous()
     sm_sum_flat = ssum.reshape(B * S1 * N1).to(torch.float32).contiguous()
 
-    # Pre-gather K/KR into contiguous [B*S1, topK, *] for sequential kernel
-    # access (same optimization as forward pregather-seq-kv).
+    # Pre-gather K/KR into contiguous [B*S1, topK, *] for sequential kernel access.
     batch_offsets = torch.arange(B, dtype=torch.int32, device=device) * S2
     sparse_global = sparse_flat.reshape(B, S1, topK) + batch_offsets.reshape(B, 1, 1)
     sparse_1d = sparse_global.reshape(-1).clamp(min=0)

@@ -1,8 +1,9 @@
 """Torch-flavored golden tests for sfa_grad_core_standalone._sfa_grad_core.
 
-Mirrors test_sfa_grad_triton.test_golden/test_basic but uses torch tensors and
-calls _sfa_grad_core directly (no MindSpore cell). The forward stats (out/smax/
-ssum) are produced by run_sfa from sfa_torch_utils. Run:
+Mirrors test_sfa_grad_triton.py test_golden/test_basic/test_smoke but uses
+torch tensors and calls _sfa_grad_core directly (no MindSpore cell). The
+forward stats (out/smax/ssum) are produced by run_sfa from sfa_torch_utils.
+Run:
     pytest test_sfa_grad_torch.py -v
     python test_sfa_grad_torch.py
 """
@@ -63,8 +64,9 @@ def _allclose(a, b, bf16=False, scale=1.0, pct_thd=99.5):
 
 # ---------------------------------------------------------------------------
 # triton vs numpy golden -- algorithm correctness, runs on any shape
+# Mirrors test_sfa_grad_triton.py test_golden (minus fwd_source=cann path)
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("B,S1,S2,N1,sc,bs,mode", [
+@pytest.mark.parametrize("B,S1,S2,N1,sparse_count,sparse_block_size,sparse_mode", [
     (1, 4, 128, 8, 64, 1, 3),       # token-wise, rightDownCausal
     (2, 16, 256, 16, 128, 1, 3),    # bigger, multi-batch
     (1, 8, 128, 8, 32, 2, 3),       # block-wise (block_size=2)
@@ -76,28 +78,27 @@ def _allclose(a, b, bf16=False, scale=1.0, pct_thd=99.5):
 ])
 @pytest.mark.parametrize("D", [128, 256, 512])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_golden(B, S1, S2, N1, sc, bs, mode, D, dtype):
+def test_golden(B, S1, S2, N1, sparse_count, sparse_block_size, sparse_mode, D, dtype):
     """Compare triton SFA backward with the numpy golden (D 128/256/512, fp16/bf16)."""
     np_dtype = _DT_NP[dtype]
     q, k, qr, kr = make_inputs(B, S1, S2, N1, D, dtype)
     do = make_dout(B, S1, N1, D, dtype)
-    si = make_sparse_indices(B, S1, S2, sc, bs, mode)
+    si = make_sparse_indices(B, S1, S2, sparse_count, sparse_block_size, sparse_mode)
     scale = 1.0 / np.sqrt(D + D_ROPE)
 
-    # Forward to get out/smax/ssum (consumed by the backward)
-    out, smax, ssum = run_sfa(q, k, qr, kr, si, bs, mode, scale, return_lse=True)
+    out, smax, ssum = run_sfa(q, k, qr, kr, si, sparse_block_size, sparse_mode,
+                              scale, return_lse=True)
 
-    # Backward
     dq, dk, dv, dqr, dkr = run_sfa_grad(
-        q, k, qr, kr, si, do, out, smax, ssum, bs, mode, scale)
+        q, k, qr, kr, si, do, out, smax, ssum,
+        sparse_block_size, sparse_mode, scale)
 
-    # Numpy golden
     g_dq, g_dk, g_dv, g_dqr, g_dkr = sparse_flash_attention_grad_golden_bsnd(
         to_np_f32(q), to_np_f32(k), to_np_f32(k), si.cpu().numpy(),
         to_np_f32(do), to_np_f32(out), to_np_f32(smax), to_np_f32(ssum),
         to_np_f32(qr), to_np_f32(kr),
         scale, [S1] * B, [S2] * B,
-        sparse_block_size=bs, sparse_mode=mode, dtype=np_dtype,
+        sparse_block_size=sparse_block_size, sparse_mode=sparse_mode, dtype=np_dtype,
     )
 
     bf16 = (dtype == torch.bfloat16)
@@ -111,8 +112,9 @@ def test_golden(B, S1, S2, N1, sc, bs, mode, D, dtype):
 
 # ---------------------------------------------------------------------------
 # functional self-checks -- shapes beyond CANN reference constraints
+# Mirrors test_sfa_grad_triton.py test_basic
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("B,S1,S2,N1,sc", [
+@pytest.mark.parametrize("B,S1,S2,N1,sparse_count", [
     (1, 128, 1024, 64, 512),
     (2, 64, 512, 32, 256),
     (1, 16, 2048, 64, 2048),   # topK=2048
@@ -121,11 +123,11 @@ def test_golden(B, S1, S2, N1, sc, bs, mode, D, dtype):
 @pytest.mark.parametrize("D", [128, 256, 512])
 @pytest.mark.parametrize("sparse_mode", [3])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_basic(B, S1, S2, N1, sc, D, sparse_mode, dtype):
+def test_basic(B, S1, S2, N1, sparse_count, D, sparse_mode, dtype):
     """Shape / dtype / finiteness checks (no reference comparison)."""
     q, k, qr, kr = make_inputs(B, S1, S2, N1, D, dtype)
     do = make_dout(B, S1, N1, D, dtype)
-    si = make_sparse_indices(B, S1, S2, sc, 1, sparse_mode)
+    si = make_sparse_indices(B, S1, S2, sparse_count, 1, sparse_mode)
     scale = 1.0 / np.sqrt(D + D_ROPE)
 
     out, smax, ssum = run_sfa(q, k, qr, kr, si, 1, sparse_mode, scale, return_lse=True)
@@ -145,10 +147,11 @@ def test_basic(B, S1, S2, N1, sc, D, sparse_mode, dtype):
 # smoke -- fast per-edit regression. Each case is a FULL param tuple (no D/dtype
 # cross-product), so the count is exactly what's listed. Reuses test_golden
 # bodies. Run after every edit:  pytest -k smoke
+# Mirrors test_sfa_grad_triton.py test_smoke_golden (minus fwd_source=cann path)
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("B,S1,S2,N1,sc,bs,mode,D,dtype", [
-    (2, 16, 256, 16, 128, 1, 3, 512, torch.float16),    # multi-batch
-    (1, 4, 128, 8, 64, 1, 3, 512, torch.bfloat16),      # bf16
+    (2, 16, 256, 16, 128, 1, 3, 512, torch.float16),    # multi-batch: pid crosses batch boundary
+    (1, 4, 128, 8, 64, 1, 3, 512, torch.bfloat16),      # B_S1<BLOCK_S1: tail-program masking + bf16
     (1, 1, 128, 8, 16, 1, 3, 128, torch.float16),       # S1=1 single row, D=128
     (1, 8, 128, 8, 32, 2, 3, 512, torch.float16),       # block-wise (bs=2)
     (1, 4, 2048, 8, 2048, 1, 3, 256, torch.float16),    # topK=2048
