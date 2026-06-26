@@ -143,20 +143,23 @@ def _patch_triton_ascend_mindspore_dtype_bytes():
 _patch_triton_ascend_mindspore_dtype_bytes()
 
 
-def _select_block_config(D, N1):
+def _select_block_config(D, N1, topK):
     block_g = min(16, max(8, N1))
-    return {"BLOCK_G": block_g, "BLOCK_K": 32, "BLOCK_D": 128}
+    block_k = 256
+    if topK < block_k:
+        block_k = 1 << (topK - 1).bit_length()
+    return {"BLOCK_G": block_g, "BLOCK_K": block_k}
 
 
 @triton.jit
 def _sfa_grad_kernel(
-    q_ptr, qr_ptr,                       # query[B,S1,N1,D], query_rope[B,S1,N1,Dr]
-    k_ptr, kr_ptr, v_ptr,                # key/key_rope/value, all [B,S2,1,*] (v aliases k)
-    sparse_ptr,                          # token indices [B,S1,1,topK] int32 (block pre-expanded)
-    do_ptr, o_ptr,                       # d_out[B,S1,N1,D], out[B,S1,N1,D]
-    sm_max_ptr, sm_sum_ptr,              # forward softmax stats, flat (b*S1+s1)*N1 + g
-    dq_ptr, dqr_ptr,                     # outputs: d_query, d_query_rope
-    dk_ptr, dkr_ptr, dv_ptr,             # outputs (fp32 workspace): d_key, d_key_rope, d_value
+    q_ptr, qr_ptr,
+    k_ptr, kr_ptr, v_ptr,
+    sparse_ptr,
+    do_ptr, o_ptr,
+    sm_max_ptr, sm_sum_ptr,
+    dq_ptr, dqr_ptr,
+    ds_ptr, dp_ptr,
     act_q_ptr, act_k_ptr,
     B_S1, S1, S2, N1, topK,
     D: tl.constexpr, D_ROPE: tl.constexpr,
@@ -167,18 +170,15 @@ def _sfa_grad_kernel(
     NUM_HC: tl.constexpr,
     NEED_CLAMP: tl.constexpr,
 ):
-    """SFA backward over sparsely gathered KV (BSND, MQA / N2=1), single pass.
+    """SFA backward — single pass, no atomic_add.
 
-    Grid: (_next_pow2(B*S1), _next_pow2(cdiv(N1, BLOCK_G))), both pow2-padded.
+    Grid: (_next_pow2(B*S1),), pow2-padded.
     Each program owns one (b,s1) and BLOCK_G query heads.
 
-    Per topK block: rebuild scores (q·k) -> P (from saved softmax stats) -> dPv
-    (dO·v, v=k_nope) -> dS = P·(dPv - delta)·scale. Accumulate dq/dqr resident
-    (no cross-program contention — each head row owned by one program); scatter-add
-    dk/dkr (dS·q) and dv (P·dO) into fp32 workspaces (many s1 rows hit one KV token).
-
-    No early-return (triton-ascend drops stores after early-return): inactive rows
-    are folded into tok_valid so dS/P become 0 and all contributions vanish.
+    Single pass: for each hc, iterate blk_start, compute scores/P/dS,
+    accumulate dq/dqr in UB, and store dS/P to GMEM workspace (sequential
+    write, no atomic). dk/dv/dkr scatter-add is done on host via bmm +
+    index_add after the kernel.
     """
     pid_bs1 = tl.program_id(0)
     bs1_in_range = pid_bs1 < B_S1
@@ -203,22 +203,13 @@ def _sfa_grad_kernel(
     upper = tl.minimum(threshold, act_k)
     upper_f = upper.to(tl.float32)
 
-    # Base offsets (shared across all stages)
     sp_base = pid_bs1 * topK
-    k_base = b * S2 * D
-    kr_base = b * S2 * D_ROPE
-    v_base = b * S2 * D
-    dq_row_base = pid_bs1 * N1 * D       # [B*S1, N1, D]
-    dqr_row_base = pid_bs1 * N1 * D_ROPE  # [B*S1, N1, D_ROPE]
+    k_rd_base = pid_bs1 * topK * D
+    kr_rd_base = pid_bs1 * topK * D_ROPE
+    dq_row_base = pid_bs1 * N1 * D
+    dqr_row_base = pid_bs1 * N1 * D_ROPE
+    ds_base = pid_bs1 * N1 * topK
 
-    # ──────────────────────────────────────────────────────────────
-    # Stage A: Compute dq/dqr for each head chunk.
-    # hc-outer, blk_start-inner loop.
-    # NO MTE3 writes in the hot loop → Cube not blocked by Vector.
-    # ──────────────────────────────────────────────────────────────
-    # Use HC_LOOP to avoid Triton compiler crash on `for hc in range(1)`
-    # (scf.For assertion failure in ttir_to_linalg). When NUM_HC == 1,
-    # the extra hc=1 iteration has g_valid all-False, contributing nothing.
     if NUM_HC == 1:
         HC_LOOP: tl.constexpr = 2
     else:
@@ -263,159 +254,37 @@ def _sfa_grad_kernel(
                          & (tok != -1)
                          & (tok_f < upper_f)
                          & row_active)
-            tok_clamped = tl.where(tok_valid, tok, 0)
 
             k_full = tl.load(
-                k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
-                mask=tok_valid[:, None], other=0.0)
+                k_ptr + k_rd_base + blk_offs[:, None] * D + d_offs[None, :])
             kr_full = tl.load(
-                kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + dr_offs[None, :],
-                mask=tok_valid[:, None], other=0.0)
+                kr_ptr + kr_rd_base + blk_offs[:, None] * D_ROPE + dr_offs[None, :])
 
             scores = tl.dot(q_nope, tl.trans(k_full)).to(tl.float32)
             scores += tl.dot(q_rope, tl.trans(kr_full)).to(tl.float32)
             scores = scores * scale_value
 
             P = tl.exp(scores - sm_max[:, None]) / sm_sum[:, None]
+            P = tl.where(tok_valid[None, :], P, 0.0)
 
             dPv = tl.dot(do_tile, tl.trans(k_full)).to(tl.float32)
             dS = P * (dPv - delta[:, None]) * scale_value
+            dS = tl.where(tok_valid[None, :], dS, 0.0)
 
             acc_dq += tl.dot(dS.to(k_full.dtype), k_full).to(tl.float32)
             acc_dqr += tl.dot(dS.to(kr_full.dtype), kr_full).to(tl.float32)
 
-        # Store dq/dqr for this head chunk (tl.store, no atomic — one program per row)
+            ds_offs = ds_base + g_offs_s[:, None] * topK + blk_offs[None, :]
+            store_mask = g_valid[:, None] & blk_in_count[None, :]
+            tl.store(ds_ptr + ds_offs, dS, mask=store_mask)
+            tl.store(dp_ptr + ds_offs, P, mask=store_mask)
+
         tl.store(dq_ptr + dq_row_base + g_offs_s[:, None] * D + d_offs[None, :],
                  acc_dq.to(dq_ptr.dtype.element_ty),
                  mask=g_valid[:, None] & row_active)
         tl.store(dqr_ptr + dqr_row_base + g_offs_s[:, None] * D_ROPE + dr_offs[None, :],
                  acc_dqr.to(dqr_ptr.dtype.element_ty),
                  mask=g_valid[:, None] & row_active)
-
-    # ──────────────────────────────────────────────────────────────
-    # Stage B1: Accumulate dk/dkr across head chunks.
-    # blk_start-outer, hc-inner loop.
-    # dk_acc/dkr_acc persist across hc iterations within one blk_start.
-    # After all hc: single atomic_add per output.
-    # ──────────────────────────────────────────────────────────────
-    for blk_start in range(0, topK, BLOCK_K):
-        blk_offs = blk_start + blk_k_offs
-        blk_in_count = blk_offs < topK
-        tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
-
-        tok_f = tok.to(tl.float32)
-        tok_valid = blk_in_count & (tok != -1) & (tok_f < upper_f) & row_active
-        tok_clamped = tl.where(tok_valid, tok, 0)
-
-        # Load k_full/kr_full once per blk_start (shared across all hc)
-        k_full = tl.load(
-            k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
-            mask=tok_valid[:, None], other=0.0)
-        kr_full = tl.load(
-            kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + dr_offs[None, :],
-            mask=tok_valid[:, None], other=0.0)
-
-        dk_acc = tl.zeros([BLOCK_K, D], dtype=tl.float32)
-        dkr_acc = tl.zeros([BLOCK_K, D_ROPE], dtype=tl.float32)
-
-        for hc in range(HC_LOOP):
-            g_offs = hc * BLOCK_G + tl.arange(0, BLOCK_G)
-            g_valid = g_offs < N1
-            if NEED_CLAMP:
-                g_offs_s = tl.where(g_valid, g_offs, 0)
-            else:
-                g_offs_s = g_offs
-
-            q_nope = tl.load(q_ptr + dq_row_base + g_offs_s[:, None] * D + d_offs[None, :],
-                             mask=g_valid[:, None], other=0.0)
-            q_rope = tl.load(qr_ptr + dqr_row_base + g_offs_s[:, None] * D_ROPE + dr_offs[None, :],
-                             mask=g_valid[:, None], other=0.0)
-            do_tile = tl.load(do_ptr + dq_row_base + g_offs_s[:, None] * D + d_offs[None, :],
-                              mask=g_valid[:, None], other=0.0)
-            o_tile = tl.load(o_ptr + dq_row_base + g_offs_s[:, None] * D + d_offs[None, :],
-                             mask=g_valid[:, None], other=0.0)
-
-            sm_max = tl.load(sm_max_ptr + pid_bs1 * N1 + g_offs_s, mask=g_valid, other=0.0)
-            sm_sum = tl.load(sm_sum_ptr + pid_bs1 * N1 + g_offs_s, mask=g_valid, other=1.0)
-            sm_sum = tl.where(sm_sum > 0.0, sm_sum, 1.0)
-
-            delta = tl.sum(do_tile.to(tl.float32) * o_tile.to(tl.float32), axis=1)
-
-            scores = tl.dot(q_nope, tl.trans(k_full)).to(tl.float32)
-            scores += tl.dot(q_rope, tl.trans(kr_full)).to(tl.float32)
-            scores = scores * scale_value
-
-            P = tl.exp(scores - sm_max[:, None]) / sm_sum[:, None]
-
-            dPv = tl.dot(do_tile, tl.trans(k_full)).to(tl.float32)
-            dS = P * (dPv - delta[:, None]) * scale_value
-
-            dk_acc += tl.dot(tl.trans(dS).to(q_nope.dtype), q_nope).to(tl.float32)
-            dkr_acc += tl.dot(tl.trans(dS).to(q_rope.dtype), q_rope).to(tl.float32)
-
-        # Single atomic_add for dk (accumulated across all head chunks)
-        dk_offs = v_base + tok_clamped[:, None] * D + d_offs[None, :]
-        tl.atomic_add(dk_ptr + dk_offs, dk_acc, mask=tok_valid[:, None])
-
-        dkr_offs = kr_base + tok_clamped[:, None] * D_ROPE + dr_offs[None, :]
-        tl.atomic_add(dkr_ptr + dkr_offs, dkr_acc, mask=tok_valid[:, None])
-
-    # ──────────────────────────────────────────────────────────────
-    # Stage B2: Accumulate dv across head chunks.
-    # Separate from B1 to reduce peak UB (dv_acc and dk_acc don't
-    # coexist).
-    # ──────────────────────────────────────────────────────────────
-    for blk_start in range(0, topK, BLOCK_K):
-        blk_offs = blk_start + blk_k_offs
-        blk_in_count = blk_offs < topK
-        tok = tl.load(sparse_ptr + sp_base + blk_offs, mask=blk_in_count, other=-1)
-
-        tok_f = tok.to(tl.float32)
-        tok_valid = (blk_in_count
-                     & (tok != -1)
-                     & (tok_f < upper_f)
-                     & row_active)
-        tok_clamped = tl.where(tok_valid, tok, 0)
-
-        k_full = tl.load(
-            k_ptr + k_base + tok_clamped[:, None] * D + d_offs[None, :],
-            mask=tok_valid[:, None], other=0.0)
-        kr_full = tl.load(
-            kr_ptr + kr_base + tok_clamped[:, None] * D_ROPE + dr_offs[None, :],
-            mask=tok_valid[:, None], other=0.0)
-
-        dv_acc = tl.zeros([BLOCK_K, D], dtype=tl.float32)
-
-        for hc in range(HC_LOOP):
-            g_offs = hc * BLOCK_G + tl.arange(0, BLOCK_G)
-            g_valid = g_offs < N1
-            if NEED_CLAMP:
-                g_offs_s = tl.where(g_valid, g_offs, 0)
-            else:
-                g_offs_s = g_offs
-
-            q_nope = tl.load(q_ptr + dq_row_base + g_offs_s[:, None] * D + d_offs[None, :],
-                             mask=g_valid[:, None], other=0.0)
-            q_rope = tl.load(qr_ptr + dqr_row_base + g_offs_s[:, None] * D_ROPE + dr_offs[None, :],
-                             mask=g_valid[:, None], other=0.0)
-            do_tile = tl.load(do_ptr + dq_row_base + g_offs_s[:, None] * D + d_offs[None, :],
-                              mask=g_valid[:, None], other=0.0)
-
-            sm_max = tl.load(sm_max_ptr + pid_bs1 * N1 + g_offs_s, mask=g_valid, other=0.0)
-            sm_sum = tl.load(sm_sum_ptr + pid_bs1 * N1 + g_offs_s, mask=g_valid, other=1.0)
-            sm_sum = tl.where(sm_sum > 0.0, sm_sum, 1.0)
-
-            scores = tl.dot(q_nope, tl.trans(k_full)).to(tl.float32)
-            scores += tl.dot(q_rope, tl.trans(kr_full)).to(tl.float32)
-            scores = scores * scale_value
-
-            P = tl.exp(scores - sm_max[:, None]) / sm_sum[:, None]
-
-            dv_acc += tl.dot(tl.trans(P).to(do_tile.dtype), do_tile).to(tl.float32)
-
-        # Single atomic_add for dv
-        dv_offs = v_base + tok_clamped[:, None] * D + d_offs[None, :]
-        tl.atomic_add(dv_ptr + dv_offs, dv_acc, mask=tok_valid[:, None])
 
 
 # ---------------------------------------------------------------------------
@@ -456,16 +325,16 @@ def _sfa_grad_core(
     scale_value: float,
     sparse_mode: int,
 ) -> tuple[ms.Tensor, ms.Tensor, ms.Tensor, ms.Tensor, ms.Tensor]:
-    # Fixed block config + single launch (NO autotune): autotune re-runs the
-    # kernel many times to benchmark, which double-counts the atomic_add scatter
-    # into dk/dkr/dv. See _select_block_config.
-    cfg = _select_block_config(D, N1)
+    cfg = _select_block_config(D, N1, topK)
     block_g = cfg["BLOCK_G"]
-    num_hc = triton.cdiv(N1, block_g)  # number of head chunks
-    need_clamp = (N1 % block_g) != 0   # need g_offs clamping only when N1 not multiple of BLOCK_G
+    num_hc = triton.cdiv(N1, block_g)
+    need_clamp = (N1 % block_g) != 0
 
-    # 1D grid, one program per query row
     grid = (_next_pow2(B_S1),)
+
+    B = B_S1 // S1
+    ds_buf = ms.mint.zeros((B_S1, N1, topK), dtype=ms.float32).to('Ascend')
+    dp_buf = ms.mint.zeros((B_S1, N1, topK), dtype=ms.float32).to('Ascend')
 
     _sfa_grad_kernel[grid](
         q_flat, qr_flat,
@@ -474,7 +343,7 @@ def _sfa_grad_core(
         do_flat, o_flat,
         sm_max_flat, sm_sum_flat,
         dq_buf, dqr_buf,
-        dk_buf, dkr_buf, dv_buf,
+        ds_buf, dp_buf,
         act_q, act_k,
         B_S1, S1, S2, N1, topK,
         D, D_ROPE,
@@ -486,6 +355,23 @@ def _sfa_grad_core(
         NEED_CLAMP=need_clamp,
         multibuffer=False,
     )
+
+    batch_offsets = ms.ops.arange(B, dtype=ms.int32) * S2
+    sparse_global = sparse_flat.reshape(B, S1, topK) + batch_offsets.reshape(B, 1, 1)
+    sparse_1d = sparse_global.reshape(-1).clamp(min=0).astype(ms.int64)
+
+    dk_contrib = ms.ops.bmm(ds_buf.reshape(B_S1, N1, topK).transpose(1, 2),
+                            q_flat.reshape(B_S1, N1, D).astype(ms.float32))
+    dk_buf = ms.ops.index_add(dk_buf, 0, sparse_1d, dk_contrib.reshape(-1, D))
+
+    dv_contrib = ms.ops.bmm(dp_buf.reshape(B_S1, N1, topK).transpose(1, 2),
+                            do_flat.reshape(B_S1, N1, D).astype(ms.float32))
+    dv_buf = ms.ops.index_add(dv_buf, 0, sparse_1d, dv_contrib.reshape(-1, D))
+
+    dkr_contrib = ms.ops.bmm(ds_buf.reshape(B_S1, N1, topK).transpose(1, 2),
+                             qr_flat.reshape(B_S1, N1, D_ROPE).astype(ms.float32))
+    dkr_buf = ms.ops.index_add(dkr_buf, 0, sparse_1d, dkr_contrib.reshape(-1, D_ROPE))
+
     return dq_buf, dqr_buf, dk_buf, dkr_buf, dv_buf
 
 
@@ -610,13 +496,17 @@ def sparse_flash_attention_grad_triton(
     o_flat = o_bsnd.contiguous()
     k_flat = k_bsnd.reshape(B * S2, D).contiguous()
     kr_flat = kr_bsnd.reshape(B * S2, D_ROPE).contiguous()
-    v_flat = k_flat
     sparse_flat = si_tok.reshape(B * S1, topK).to(ms.int32).contiguous()
     sm_max_flat = sm_max_bsnd.reshape(B * S1 * N1).astype(ms.float32).contiguous()
     sm_sum_flat = sm_sum_bsnd.reshape(B * S1 * N1).astype(ms.float32).contiguous()
 
-    # Output buffers must live on-device (mint.zeros defaults to CPU -> triton
-    # rejects the pointer). dk/dkr/dv accumulate via atomic_add, so fp32 workspace.
+    batch_offsets = ms.ops.arange(B, dtype=ms.int32) * S2
+    sparse_global = sparse_flat.reshape(B, S1, topK) + batch_offsets.reshape(B, 1, 1)
+    sparse_1d = sparse_global.reshape(-1).clamp(min=0)
+    k_gathered = ms.ops.gather(k_flat, sparse_1d, axis=0).reshape(B * S1, topK, D).contiguous()
+    kr_gathered = ms.ops.gather(kr_flat, sparse_1d, axis=0).reshape(B * S1, topK, D_ROPE).contiguous()
+    v_gathered = k_gathered
+
     dq_buf = ms.mint.zeros((B, S1, N1, D), dtype=q_bsnd.dtype).to('Ascend')
     dqr_buf = ms.mint.zeros((B, S1, N1, D_ROPE), dtype=qr_bsnd.dtype).to('Ascend')
     dk_buf = ms.mint.zeros((B * S2, D), dtype=ms.float32).to('Ascend')
@@ -625,7 +515,7 @@ def sparse_flash_attention_grad_triton(
 
     dq_buf, dqr_buf, dk_buf, dkr_buf, dv_buf = _sfa_grad_core(
         q_flat, qr_flat,
-        k_flat, kr_flat, v_flat,
+        k_gathered, kr_gathered, v_gathered,
         sparse_flat,
         do_flat, o_flat,
         sm_max_flat, sm_sum_flat,
